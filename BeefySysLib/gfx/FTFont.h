@@ -131,7 +131,7 @@ public:
 	
 	bool Load(const StringImpl& file, float pointSize);	
 
-	FTFontManager::Glyph* AllocGlyph(int charCode, bool allowDefault, uint32 foregroundColor, uint32 backgroundColor);
+	FTFontManager::Glyph* AllocGlyph(int charCode, bool allowDefault);
 	int GetKerning(int charA, int charB);
 
 	void Release(bool cacheRetain = false);

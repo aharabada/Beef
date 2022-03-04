@@ -48,7 +48,7 @@ namespace Beefy.gfx
 		static extern void FTFont_ClearCache();
 
 		[CallingConvention(.Stdcall), CLink]
-		static extern FTGlyph* FTFont_AllocGlyph(FTFont* ftFont, int32 char8Code, bool allowDefault, uint32 foregroundColor, uint32 backgroundColor);
+		static extern FTGlyph* FTFont_AllocGlyph(FTFont* ftFont, int32 char8Code, bool allowDefault);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern int32 FTFont_GetKerning(FTFont* font, int32 char8CodeA, int32 char8CodeB);
@@ -123,9 +123,9 @@ namespace Beefy.gfx
 
         const int32 LOW_CHAR_COUNT = 128;
 
-		struct CharAccessor : this(char32 Char, uint32 Foreground, uint32 Background), IHashable
+		struct CharAccessor : this(char32 Char), IHashable // , uint32 Foreground, uint32 Background
 		{
-			public int GetHashCode() => ((((int)Char << 17) ^ (int)Foreground) << 17) ^ (int)Background;
+			public int GetHashCode() => (int)Char;//((((int)Char << 17) ^ (int)Foreground) << 17) ^ (int)Background;
 		}
 
         Dictionary<CharAccessor, CharData> mCharData;
@@ -490,7 +490,7 @@ namespace Beefy.gfx
 				{
 					continue;
 				}
-                CharData charData = GetCharData((char32)c, Color.Black, Color.White);
+                CharData charData = GetCharData((char32)c);
 				if ((charData != null) && (!charData.mIsCombiningMark))
 				{
 	                curX += charData.mXAdvance;
@@ -530,11 +530,11 @@ namespace Beefy.gfx
 			return .OverC;
 		}
 
-        CharData GetCharData(char32 checkChar, uint32 foregroundColor, uint32 backgroundColor)
+        CharData GetCharData(char32 checkChar)//, uint32 foregroundColor, uint32 backgroundColor)
         {
             CharData charData;
 			
-			CharAccessor accessor = .(checkChar, foregroundColor, backgroundColor);
+			CharAccessor accessor = .(checkChar); // , foregroundColor, backgroundColor
 
             //if ((checkChar >= (char8)0) && (checkChar < (char32)LOW_CHAR_COUNT))
             //    charData = mLowCharData[(int)checkChar];
@@ -554,10 +554,10 @@ namespace Beefy.gfx
 					if (ftFont == null)
 						continue;
 
-					Debug.WriteLine($"Made some chars! {checkChar}, {foregroundColor}, {backgroundColor}");
+					Debug.WriteLine($"Made some chars! {checkChar}");
 
 					//var ftGlyph = FTFont_AllocGlyph(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1, foregroundColor, backgroundColor);
-					var ftGlyph = FTFont_AllocGlyph(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1, Color.White, Color.Black);
+					var ftGlyph = FTFont_AllocGlyph(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1);
 					if (ftGlyph == null)
 						continue;
 
@@ -591,7 +591,7 @@ namespace Beefy.gfx
 				
 				if (checkChar == (char32)'?')
 					return null;
-				return GetCharData((char32)'?', foregroundColor, backgroundColor);
+				return GetCharData((char32)'?');
 			}
             return charData;
         }
@@ -601,7 +601,7 @@ namespace Beefy.gfx
 			if (mMarkRefData == null)
 			{
 				mMarkRefData = new MarkRefData();
-				var charData = GetCharData('o', Color.Black, Color.White);
+				var charData = GetCharData('o');
 				mMarkRefData.mTop = charData.mYOffset;
 				mMarkRefData.mBottom = charData.mYOffset + charData.mHeight;
 			}
@@ -610,7 +610,7 @@ namespace Beefy.gfx
 
         public float GetWidth(char32 theChar)
         {
-            CharData charData = GetCharData(theChar, Color.Black, Color.White);
+            CharData charData = GetCharData(theChar);
             return charData.mXAdvance;
         }
 
@@ -643,7 +643,7 @@ namespace Beefy.gfx
 					}
 				}
 
-                CharData charData = GetCharData(c, Color.Black, Color.White);
+                CharData charData = GetCharData(c);
                 curX += charData.mXAdvance;
                 if (prevChar != (char32)0)
                 {
@@ -765,7 +765,7 @@ namespace Beefy.gfx
 					continue;
 				}
 
-                CharData charData = GetCharData(c, color, Color.Black);
+                CharData charData = GetCharData(c);
 				float drawX = curX + charData.mXOffset;
 				float drawY = curY + charData.mYOffset;
 				

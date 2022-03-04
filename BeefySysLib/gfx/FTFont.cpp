@@ -198,7 +198,7 @@ bool FTFont::Load(const StringImpl& fileName, float pointSize)
 
 TextureSegment* BF_CALLTYPE Gfx_CreateTextureSegment(TextureSegment* textureSegment, int srcX, int srcY, int srcWidth, int srcHeight);
 
-FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault, uint32 foregroundColor, uint32 backgroundColor)
+FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault)
 {	
 	FT_Activate_Size(mFaceSize->mFTSize);
 
@@ -285,6 +285,7 @@ FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault, uint32
 
 	if (bitmap.width > 0)
 	{
+		/*
 		float fgR = (uint8)(foregroundColor >> 16) / 255.0f;
 		float fgG = (uint8)(foregroundColor >> 8) / 255.0f;
 		float fgB = (uint8)(foregroundColor) / 255.0f;
@@ -294,7 +295,7 @@ FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault, uint32
 		float bgG = (uint8)(backgroundColor >> 8) / 255.0f;
 		float bgB = (uint8)(backgroundColor) / 255.0f;
 		float bgA = (uint8)(backgroundColor >> 24) / 255.0f;
-
+		*/
 		ImageData img;
 		img.CreateNew(bitmap.width / 3, bitmap.rows);
 		//img.CreateNew(bitmap.width, bitmap.rows);
@@ -306,7 +307,7 @@ FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault, uint32
 
 				//uint8 whiteVal = gFTFontManager.mWhiteTab[val];
 				//uint8 blackVal = gFTFontManager.mBlackTab[val];
-
+				/*
 				uint8 a = 255;
 				uint8 r = *val;
 				uint8 g = *(val + 1);
@@ -324,9 +325,16 @@ FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault, uint32
 				float blendedR = fr * fgR + (1.0f - fr) * bgR;
 				float blendedG = fg * fgG + (1.0f - fg) * bgG;
 				float blendedB = fb * fgB + (1.0f - fb) * bgB;
+				*/
+				//img.mBits[y * img.mWidth + x] = ((int32)a << 24) | ((int32)(blendedB * 255.0f) << 16) | ((int32)(blendedG * 255.0f) << 8) | ((int32)(blendedR * 255.0f));
 
-				img.mBits[y * img.mWidth + x] = ((int32)a << 24) | ((int32)(blendedB * 255.0f) << 16) | ((int32)(blendedG * 255.0f) << 8) | ((int32)(blendedR * 255.0f));
+				uint8 a = 255;
+				uint8 r = *val;
+				uint8 g = *(val + 1);
+				uint8 b = *(val + 2);
 
+				img.mBits[y * img.mWidth + x] = ((uint32)a << 24) | ((uint32)b << 16) | ((uint32)g << 8) | ((uint32)(r));
+				
 				//img.mBits[y * img.mWidth + x] = ((int32)255 << 24) | val;
 					//((int32)whiteVal << 24) |
 					//((int32)blackVal) | ((int32)0xFF << 8) | ((int32)0xFF << 16);
@@ -395,9 +403,9 @@ BF_EXPORT void BF_CALLTYPE FTFont_Delete(FTFont* ftFont, bool cacheRetain)
 	ftFont->Release(cacheRetain);
 }
 
-BF_EXPORT FTFontManager::Glyph* BF_CALLTYPE FTFont_AllocGlyph(FTFont* ftFont, int charCode, bool allowDefault, uint32 foregroundColor, uint32 backgroundColor)
+BF_EXPORT FTFontManager::Glyph* BF_CALLTYPE FTFont_AllocGlyph(FTFont* ftFont, int charCode, bool allowDefault)
 {
-	return ftFont->AllocGlyph(charCode, allowDefault, foregroundColor, backgroundColor);
+	return ftFont->AllocGlyph(charCode, allowDefault);
 }
 
 BF_EXPORT int BF_CALLTYPE FTFont_GetKerning(FTFont* ftFont, int charCodeA, int charCodeB)
