@@ -154,6 +154,7 @@ enum TextureFlag : int8
 	TextureFlag_Additive = 1,
 	TextureFlag_NoPremult = 2,
 	TextureFlag_AllowRead = 4,
+	TextureFlag_SRGB = 8
 };
 
 struct VertexDefData

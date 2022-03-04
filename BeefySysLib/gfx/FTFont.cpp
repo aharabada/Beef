@@ -198,7 +198,7 @@ bool FTFont::Load(const StringImpl& fileName, float pointSize)
 
 TextureSegment* BF_CALLTYPE Gfx_CreateTextureSegment(TextureSegment* textureSegment, int srcX, int srcY, int srcWidth, int srcHeight);
 
-FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault)
+FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault, uint32 foregroundColor, uint32 backgroundColor)
 {	
 	FT_Activate_Size(mFaceSize->mFTSize);
 
@@ -210,7 +210,9 @@ FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault)
 	if (error != FT_Err_Ok)
 		return NULL;
 	
-	error = FT_Render_Glyph(mFace->mFTFace->glyph, FT_RENDER_MODE_NORMAL);
+	// TODO: ClearType Switch
+	//error = FT_Render_Glyph(mFace->mFTFace->glyph, FT_RENDER_MODE_NORMAL);
+	error = FT_Render_Glyph(mFace->mFTFace->glyph, FT_RENDER_MODE_LCD);
 	if (error != FT_Err_Ok)
 		return NULL;
 		
@@ -269,31 +271,65 @@ FTFontManager::Glyph* FTFont::AllocGlyph(int charCode, bool allowDefault)
 		img.CreateNew(FT_PAGE_WIDTH, FT_PAGE_HEIGHT);
 		for (int i = 0; i < FT_PAGE_HEIGHT * FT_PAGE_WIDTH; i++)
 		{
-			if (i % 3 == 0)
+			/*if (i % 3 == 0)
 				img.mBits[i] = 0xFFFF0000;
 			else if (i % 3 == 1)
 				img.mBits[i] = 0xFF00FF00;
 			else
-				img.mBits[i] = 0xFF0000FF;
+				img.mBits[i] = 0xFF0000FF;*/
+
+			img.mBits[i] = 0;
 		}
 		page->mTexture = gBFApp->mRenderDevice->LoadTexture(&img, TextureFlag_NoPremult);		
 	}
 
 	if (bitmap.width > 0)
 	{
+		float fgR = (uint8)(foregroundColor >> 16) / 255.0f;
+		float fgG = (uint8)(foregroundColor >> 8) / 255.0f;
+		float fgB = (uint8)(foregroundColor) / 255.0f;
+		float fgA = (uint8)(foregroundColor >> 24) / 255.0f;
+
+		float bgR = (uint8)(backgroundColor >> 16) / 255.0f;
+		float bgG = (uint8)(backgroundColor >> 8) / 255.0f;
+		float bgB = (uint8)(backgroundColor) / 255.0f;
+		float bgA = (uint8)(backgroundColor >> 24) / 255.0f;
+
 		ImageData img;
-		img.CreateNew(bitmap.width, bitmap.rows);
+		img.CreateNew(bitmap.width / 3, bitmap.rows);
+		//img.CreateNew(bitmap.width, bitmap.rows);
 		for (int y = 0; y < (int)bitmap.rows; y++)
 		{
-			for (int x = 0; x < (int)bitmap.width; x++)
+			for (int x = 0; x < (int)bitmap.width / 3; x++)
 			{
-				uint8 val = bitmap.buffer[y * bitmap.pitch + x];
+				uint8* val = &bitmap.buffer[y * bitmap.pitch + x * 3];
 
-				uint8 whiteVal = gFTFontManager.mWhiteTab[val];
-				uint8 blackVal = gFTFontManager.mBlackTab[val];
+				//uint8 whiteVal = gFTFontManager.mWhiteTab[val];
+				//uint8 blackVal = gFTFontManager.mBlackTab[val];
 
-				img.mBits[y * img.mWidth + x] = ((int32)whiteVal << 24) |
-					((int32)blackVal) | ((int32)0xFF << 8) | ((int32)0xFF << 16);
+				uint8 a = 255;
+				uint8 r = *val;
+				uint8 g = *(val + 1);
+				uint8 b = *(val + 2);
+
+				float fr = (r / 255.0f);
+				float fg = (g / 255.0f);
+				float fb = (b / 255.0f);
+
+				// float blendedR = (r / 255.0f) * (uint8)(foregroundColor >> 16) / 255.0f + (1.0f - (r / 255.0f)) * (uint8)(backgroundColor >> 16) / 255.0f;
+				// float blendedR = (r * (uint8)(foregroundColor >> 16) / (255.0f * 255.0f) + (255.0f - r ) / 255.0f * (uint8)(backgroundColor >> 16) / 255.0f;
+				// float blendedR = (r * (uint8)(foregroundColor >> 16) / (255.0f * 255.0f) + ((255.0f - r) * (uint8)(backgroundColor >> 16)) / (255.0f * 255.0f);
+				// float blendedR = (r * fgR + (255.0f - r) * bgR) / (255.0f * 255.0f);
+
+				float blendedR = fr * fgR + (1.0f - fr) * bgR;
+				float blendedG = fg * fgG + (1.0f - fg) * bgG;
+				float blendedB = fb * fgB + (1.0f - fb) * bgB;
+
+				img.mBits[y * img.mWidth + x] = ((int32)a << 24) | ((int32)(blendedB * 255.0f) << 16) | ((int32)(blendedG * 255.0f) << 8) | ((int32)(blendedR * 255.0f));
+
+				//img.mBits[y * img.mWidth + x] = ((int32)255 << 24) | val;
+					//((int32)whiteVal << 24) |
+					//((int32)blackVal) | ((int32)0xFF << 8) | ((int32)0xFF << 16);
 			}
 		}
 		page->mTexture->Blt(&img, page->mCurX, page->mCurY);
@@ -359,9 +395,9 @@ BF_EXPORT void BF_CALLTYPE FTFont_Delete(FTFont* ftFont, bool cacheRetain)
 	ftFont->Release(cacheRetain);
 }
 
-BF_EXPORT FTFontManager::Glyph* BF_CALLTYPE FTFont_AllocGlyph(FTFont* ftFont, int charCode, bool allowDefault)
+BF_EXPORT FTFontManager::Glyph* BF_CALLTYPE FTFont_AllocGlyph(FTFont* ftFont, int charCode, bool allowDefault, uint32 foregroundColor, uint32 backgroundColor)
 {
-	return ftFont->AllocGlyph(charCode, allowDefault);
+	return ftFont->AllocGlyph(charCode, allowDefault, foregroundColor, backgroundColor);
 }
 
 BF_EXPORT int BF_CALLTYPE FTFont_GetKerning(FTFont* ftFont, int charCodeA, int charCodeB)

@@ -48,7 +48,7 @@ namespace Beefy.gfx
 		static extern void FTFont_ClearCache();
 
 		[CallingConvention(.Stdcall), CLink]
-		static extern FTGlyph* FTFont_AllocGlyph(FTFont* ftFont, int32 char8Code, bool allowDefault);
+		static extern FTGlyph* FTFont_AllocGlyph(FTFont* ftFont, int32 char8Code, bool allowDefault, uint32 foregroundColor, uint32 backgroundColor);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern int32 FTFont_GetKerning(FTFont* font, int32 char8CodeA, int32 char8CodeB);
@@ -123,7 +123,12 @@ namespace Beefy.gfx
 
         const int32 LOW_CHAR_COUNT = 128;
 
-        Dictionary<char32, CharData> mCharData;
+		struct CharAccessor : this(char32 Char, uint32 Foreground, uint32 Background), IHashable
+		{
+			public int GetHashCode() => ((((int)Char << 17) ^ (int)Foreground) << 17) ^ (int)Background;
+		}
+
+        Dictionary<CharAccessor, CharData> mCharData;
         CharData[] mLowCharData;
 		FTFont* mFTFont;
 		String mPath;
@@ -415,7 +420,7 @@ namespace Beefy.gfx
         {
 			Dispose();
 
-			mCharData = new Dictionary<char32, CharData>();
+			mCharData = new Dictionary<CharAccessor, CharData>();
 			mLowCharData = new CharData[LOW_CHAR_COUNT];
 			mAlternates = new List<AltFont>();
 
@@ -485,7 +490,7 @@ namespace Beefy.gfx
 				{
 					continue;
 				}
-                CharData charData = GetCharData((char32)c);
+                CharData charData = GetCharData((char32)c, Color.Black, Color.White);
 				if ((charData != null) && (!charData.mIsCombiningMark))
 				{
 	                curX += charData.mXAdvance;
@@ -525,13 +530,18 @@ namespace Beefy.gfx
 			return .OverC;
 		}
 
-        CharData GetCharData(char32 checkChar)
+        CharData GetCharData(char32 checkChar, uint32 foregroundColor, uint32 backgroundColor)
         {
             CharData charData;
-            if ((checkChar >= (char8)0) && (checkChar < (char32)LOW_CHAR_COUNT))
-                charData = mLowCharData[(int)checkChar];
-            else
-                mCharData.TryGetValue(checkChar, out charData);
+			
+			CharAccessor accessor = .(checkChar, foregroundColor, backgroundColor);
+
+            //if ((checkChar >= (char8)0) && (checkChar < (char32)LOW_CHAR_COUNT))
+            //    charData = mLowCharData[(int)checkChar];
+            //else
+			{
+                mCharData.TryGetValue(accessor, out charData);
+			}
             if (charData == null)
 			{
 				for (int fontIdx = -1; fontIdx < mAlternates.Count; fontIdx++)
@@ -544,7 +554,9 @@ namespace Beefy.gfx
 					if (ftFont == null)
 						continue;
 
-					var ftGlyph = FTFont_AllocGlyph(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1);
+					Debug.WriteLine($"Made some chars! {checkChar}, {foregroundColor}, {backgroundColor}");
+
+					var ftGlyph = FTFont_AllocGlyph(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1, foregroundColor, backgroundColor);
 					if (ftGlyph == null)
 						continue;
 
@@ -567,16 +579,18 @@ namespace Beefy.gfx
 					charData.mIsCombiningMark = ((checkChar >= '\u{0300}') && (checkChar <= '\u{036F}')) || ((checkChar >= '\u{1DC0}') && (checkChar <= '\u{1DFF}'));
 					if (charData.mIsCombiningMark)
 						charData.mXAdvance = 0;
-					if ((checkChar >= (char32)0) && (checkChar < (char32)LOW_CHAR_COUNT))
-						mLowCharData[(int)checkChar] = charData;
-					else
-						mCharData[checkChar] = charData;
+					//if ((checkChar >= (char32)0) && (checkChar < (char32)LOW_CHAR_COUNT))
+					//	mLowCharData[(int)checkChar] = charData;
+					//else
+					{
+						mCharData[accessor] = charData;
+					}
 	                return charData;
 				}
 				
 				if (checkChar == (char32)'?')
 					return null;
-				return GetCharData((char32)'?');
+				return GetCharData((char32)'?', foregroundColor, backgroundColor);
 			}
             return charData;
         }
@@ -586,7 +600,7 @@ namespace Beefy.gfx
 			if (mMarkRefData == null)
 			{
 				mMarkRefData = new MarkRefData();
-				var charData = GetCharData('o');
+				var charData = GetCharData('o', Color.Black, Color.White);
 				mMarkRefData.mTop = charData.mYOffset;
 				mMarkRefData.mBottom = charData.mYOffset + charData.mHeight;
 			}
@@ -595,7 +609,7 @@ namespace Beefy.gfx
 
         public float GetWidth(char32 theChar)
         {
-            CharData charData = GetCharData(theChar);
+            CharData charData = GetCharData(theChar, Color.Black, Color.White);
             return charData.mXAdvance;
         }
 
@@ -628,7 +642,7 @@ namespace Beefy.gfx
 					}
 				}
 
-                CharData charData = GetCharData(c);
+                CharData charData = GetCharData(c, Color.Black, Color.White);
                 curX += charData.mXAdvance;
                 if (prevChar != (char32)0)
                 {
@@ -707,6 +721,7 @@ namespace Beefy.gfx
         public void Draw(Graphics g, StringView theString, FontMetrics* fontMetrics = null)
         {
 			if (mFTFont == null)
+
 				return;
 
             float curX = 0;
@@ -749,7 +764,7 @@ namespace Beefy.gfx
 					continue;
 				}
 
-                CharData charData = GetCharData(c);
+                CharData charData = GetCharData(c, color, Color.Black);
 				float drawX = curX + charData.mXOffset;
 				float drawY = curY + charData.mYOffset;
 				
@@ -817,7 +832,7 @@ namespace Beefy.gfx
 				}
 
 				if (!isFullyClipped)
-                    charData.mImageSegment.Draw(newMatrix, g.ZDepth, color);
+                    charData.mImageSegment.Draw(newMatrix, g.ZDepth, Color.White);// color
 
                 curX += charData.mXAdvance;
 
