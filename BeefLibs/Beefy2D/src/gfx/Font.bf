@@ -556,7 +556,8 @@ namespace Beefy.gfx
 
 					Debug.WriteLine($"Made some chars! {checkChar}, {foregroundColor}, {backgroundColor}");
 
-					var ftGlyph = FTFont_AllocGlyph(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1, foregroundColor, backgroundColor);
+					//var ftGlyph = FTFont_AllocGlyph(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1, foregroundColor, backgroundColor);
+					var ftGlyph = FTFont_AllocGlyph(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1, Color.White, Color.Black);
 					if (ftGlyph == null)
 						continue;
 
@@ -832,7 +833,7 @@ namespace Beefy.gfx
 				}
 
 				if (!isFullyClipped)
-                    charData.mImageSegment.Draw(newMatrix, g.ZDepth, Color.White);// color
+                    charData.mImageSegment.Draw(newMatrix, g.ZDepth, color);
 
                 curX += charData.mXAdvance;
 

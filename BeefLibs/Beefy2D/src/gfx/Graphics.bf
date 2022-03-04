@@ -411,6 +411,7 @@ namespace Beefy.gfx
 		public void PushTextRenderState()
 		{
 			var textRenderState = AllocRenderState(mTextShader, mClipRect, mTexWrap);
+			textRenderState.CleartypeRendering = true;
 			//textRenderState.ClipRect = mClipRect;
 			//textRenderState.Shader = mTextShader;
 			PushRenderState(textRenderState);

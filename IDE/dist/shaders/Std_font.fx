@@ -37,8 +37,16 @@ PS_INPUT VS(VS_INPUT input)
     return output;  
 }
 
-float4 PS(PS_INPUT input) : SV_Target
+struct PS_OUTPUT
 {
+	float4 ForegroundColor : SV_Target0;
+	float4 TextureColor : SV_Target1;
+};
+
+//float4 PS(PS_INPUT input) : SV_Target
+PS_OUTPUT PS(PS_INPUT input)
+{
+	/*
 	float4 aTex = tex2D.Sample(linearSampler, input.Tex);
 	float aGrey = input.Color.r * 0.299 + input.Color.g * 0.587 + input.Color.b * 0.114;
 		float a = lerp(aTex.a, 0, aGrey);
@@ -49,4 +57,11 @@ float4 PS(PS_INPUT input) : SV_Target
 	float b = aTex.b * input.Color.b + (1.0 - aTex.b) * BackgroundColor.b;// * v_background_colour_linear.b
 
     return float4(r, g, b, aTex.a); // * input.Color;
+	*/
+
+	PS_OUTPUT output;
+	output.TextureColor = tex2D.Sample(linearSampler, input.Tex);
+	output.ForegroundColor = input.Color;
+
+	return output;
 }

@@ -195,6 +195,8 @@ public:
 	CullMode				mCullMode;
 	Topology3D				mTopology;
 
+	bool					mCleartypeBlending;
+
 public:
 	RenderState();
 	virtual ~RenderState() {}
@@ -207,6 +209,8 @@ public:
 	virtual void SetWriteDepthBuffer(bool writeDepthBuffer) { mWriteDepthBuffer = writeDepthBuffer; }
 	virtual void SetDepthFunc(DepthFunc depthFunc) { mDepthFunc = depthFunc; }
 	virtual void SetTopology(Topology3D topology) { mTopology = topology; }
+	
+	virtual void SetCleartypeBlending(bool cleartypeBlending) { mCleartypeBlending = cleartypeBlending; }
 };
 
 class PoolData

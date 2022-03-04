@@ -24,6 +24,7 @@ RenderState::RenderState()
 	mClipped = false;
 	mTexWrap = false;
 	mWireframe = false;
+	mCleartypeBlending = false;
 }
 
 RenderTarget::RenderTarget()

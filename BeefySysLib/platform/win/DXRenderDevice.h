@@ -193,6 +193,7 @@ class DXRenderState : public RenderState
 public:
 	ID3D11RasterizerState*	mD3DRasterizerState;
 	ID3D11DepthStencilState* mD3DDepthStencilState;
+	ID3D11BlendState* mD3DBlendState;
 
 public:
 	DXRenderState();
@@ -202,13 +203,16 @@ public:
 	void ReinitNative();
 
 	void InvalidateRasterizerState();
-	void IndalidateDepthStencilState();	
+	void IndalidateDepthStencilState();
+	void IndalidateBlendState();
 
 	virtual void SetClipped(bool clipped);
 	virtual void SetTexWrap(bool clipped);
 	virtual void SetClipRect(const Rect& rect);
 	virtual void SetWriteDepthBuffer(bool writeDepthBuffer);
 	virtual void SetDepthFunc(DepthFunc depthFunc);
+
+	virtual void SetCleartypeBlending(bool cleartypeBlending) override;
 };
 
 class DXModelPrimitives

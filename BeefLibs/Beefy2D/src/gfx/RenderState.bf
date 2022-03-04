@@ -42,6 +42,9 @@ namespace Beefy.gfx
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void RenderState_SetWireframe(void* renderState, bool wireframe);
+		
+		[CallingConvention(.Stdcall), CLink]
+		static extern void RenderState_SetCleartypeBlending(void* renderState, bool cleartypeBlending);
 
         [CallingConvention(.Stdcall), CLink]
         static extern void RenderState_DisableClip(void* renderState);
@@ -141,6 +144,14 @@ namespace Beefy.gfx
 			set
 			{
 				RenderState_SetTopology(mNativeRenderState, (.)value);
+			}
+		}
+
+		public bool CleartypeRendering
+		{
+			set
+			{
+				RenderState_SetCleartypeBlending(mNativeRenderState, value);
 			}
 		}
     }

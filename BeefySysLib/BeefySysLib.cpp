@@ -706,6 +706,11 @@ BF_EXPORT void BF_CALLTYPE RenderState_SetWireframe(RenderState* renderState, bo
 	renderState->SetWireframe(wireframe);
 }
 
+BF_EXPORT void BF_CALLTYPE RenderState_SetCleartypeBlending(RenderState* renderState, bool cleartypeBlending)
+{
+	renderState->SetCleartypeBlending(cleartypeBlending);
+}
+
 BF_EXPORT void BF_CALLTYPE RenderState_SetClip(RenderState* renderState, float x, float y, float width, float height)
 {	
 	BF_ASSERT((width >= 0) && (height >= 0));
