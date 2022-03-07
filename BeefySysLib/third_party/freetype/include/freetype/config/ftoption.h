@@ -119,7 +119,7 @@ FT_BEGIN_HEADER
   /* rendering technology that produces excellent output without LCD       */
   /* filtering.                                                            */
   /*                                                                       */
-/* #define FT_CONFIG_OPTION_SUBPIXEL_RENDERING */
+#define FT_CONFIG_OPTION_SUBPIXEL_RENDERING
 
 
   /*************************************************************************/

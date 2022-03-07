@@ -5,6 +5,7 @@
 #include "BFApp.h"
 
 #include "freetype/ftsizes.h"
+#include FT_LCD_FILTER_H
 
 #include "util/AllocDebug.h"
 
@@ -134,6 +135,8 @@ bool FTFont::Load(const StringImpl& fileName, float pointSize)
 	if (gFTLibrary == NULL)
 		FT_Init_FreeType(&gFTLibrary);
 	
+	FT_Library_SetLcdFilter(gFTLibrary, FT_LCD_FILTER_DEFAULT);
+
 	FTFontManager::Face* face = NULL;
 
 	FTFontManager::Face** facePtr = NULL;

@@ -357,7 +357,7 @@ namespace Beefy.gfx
             return mClipDisposeProxy;
         }
 
-		RenderState AllocRenderState(Shader shader, Rect? clipRect, bool texWrap)
+		RenderState AllocRenderState(Shader shader, Rect? clipRect, bool texWrap, bool clearTypeBlending = false)
 		{
 			RenderState renderState = null;
 			var curRenderState = mRenderStateStack[mRenderStateStackIdx];
@@ -376,6 +376,7 @@ namespace Beefy.gfx
 			renderState.TexWrap = texWrap;
 			renderState.Shader = shader;
 			renderState.ClipRect = clipRect;
+			renderState.CleartypeRendering = clearTypeBlending;
 			return renderState;
 		}
 
@@ -410,8 +411,8 @@ namespace Beefy.gfx
 
 		public void PushTextRenderState()
 		{
-			var textRenderState = AllocRenderState(mTextShader, mClipRect, mTexWrap);
-			textRenderState.CleartypeRendering = true;
+			var textRenderState = AllocRenderState(mTextShader, mClipRect, mTexWrap, true);
+			//textRenderState.CleartypeRendering = true;
 			//textRenderState.ClipRect = mClipRect;
 			//textRenderState.Shader = mTextShader;
 			PushRenderState(textRenderState);

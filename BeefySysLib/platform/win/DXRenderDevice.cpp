@@ -681,30 +681,25 @@ void DXRenderDevice::PhysSetRenderState(RenderState* renderState)
 			D3D11_BLEND_DESC BlendState;
 			ZeroMemory(&BlendState, sizeof(D3D11_BLEND_DESC));
 
+			BlendState.RenderTarget[0].BlendEnable = TRUE;
+
 			if (dxRenderState->mCleartypeBlending)
 			{
-				BlendState.RenderTarget[0].BlendEnable = TRUE;
 				BlendState.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC1_COLOR;
 				BlendState.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC1_COLOR;
-
 				BlendState.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-				BlendState.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-				BlendState.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
-				BlendState.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-				BlendState.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 			}
 			else
 			{
-				BlendState.RenderTarget[0].BlendEnable = TRUE;
 				BlendState.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
-
 				BlendState.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
 				BlendState.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-				BlendState.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-				BlendState.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
-				BlendState.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-				BlendState.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 			}
+
+			BlendState.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+			BlendState.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+			BlendState.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+			BlendState.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 
 			mD3DDevice->CreateBlendState(&BlendState, &dxRenderState->mD3DBlendState);
 		}
@@ -738,6 +733,8 @@ RenderState* DXRenderDevice::CreateRenderState(RenderState* srcRenderState)
 			renderState->mD3DRasterizerState->AddRef();
 		if (renderState->mD3DDepthStencilState != NULL)
 			renderState->mD3DDepthStencilState->AddRef();
+		if (renderState->mD3DBlendState != NULL)
+			renderState->mD3DBlendState->AddRef();
 	}
 	mRenderStates.Add(renderState);
 	return renderState;
