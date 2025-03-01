@@ -7286,6 +7286,12 @@ void BfModule::Visit(BfDeferStatement* deferStmt)
 		scope = FindScope(deferStmt->mScopeName, true);
 	else
 		scope = mCurMethodState->mCurScope;
+	
+	if (scope == NULL)
+	{
+		AssertErrorState();
+		return;
+	}
 
 	if ((mCompiler->mResolvePassData != NULL) && (mCompiler->mResolvePassData->mAutoComplete != NULL))
 	{
