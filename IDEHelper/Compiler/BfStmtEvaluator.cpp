@@ -7283,7 +7283,16 @@ void BfModule::Visit(BfDeferStatement* deferStmt)
 			scope = &mCurMethodState->mHeadScope;
 	}
 	else if (deferStmt->mScopeName != NULL)
+	{
 		scope = FindScope(deferStmt->mScopeName, true);
+
+		if (scope == NULL)
+		{
+			AssertErrorState();
+			// The scope doesn't exist, continue with the current scope so we still get a reasonable evaluation of the block's content
+			scope = mCurMethodState->mCurScope;
+		}
+	}
 	else
 		scope = mCurMethodState->mCurScope;
 	
