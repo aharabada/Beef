@@ -16,6 +16,75 @@ namespace IDE.ui
 			{
 			}
 
+			public bool IsSelectionSubmittable
+			{
+				get
+				{
+					return (mSelectIdx >= 0) && (mSelectIdx < mItemWidgets.Count) && (!mItemWidgets[mSelectIdx].mMenuItem.mDisabled);
+				}
+			}
+
+			/// Returns the first enabled item index at startIdx or continuing in 'dir' (wrapping), or -1
+			int FindEnabledIdx(int startIdx, int dir)
+			{
+				int count = mItemWidgets.Count;
+				if (count == 0)
+					return -1;
+				int idx = startIdx;
+				for (int i < count)
+				{
+					idx = ((idx % count) + count) % count;
+					if (!mItemWidgets[idx].mMenuItem.mDisabled)
+						return idx;
+					idx += dir;
+				}
+				return -1;
+			}
+
+			public void SelectFirstEnabled()
+			{
+				SetSelection(FindEnabledIdx(0, 1));
+			}
+
+			public override void KeyDown(KeyCode keyCode, bool isRepeat)
+			{
+				// Like MenuWidget.KeyDown, but navigation skips disabled items
+				switch (keyCode)
+				{
+				case .Home:
+					SetSelection(FindEnabledIdx(0, 1));
+				case .End:
+					SetSelection(FindEnabledIdx(mItemWidgets.Count - 1, -1));
+				case .Up:
+					if (mSelectIdx == -1)
+						SelectFirstEnabled();
+					else
+						SetSelection(FindEnabledIdx(mSelectIdx - 1, -1));
+				case .Down:
+					if (mSelectIdx == -1)
+						SelectFirstEnabled();
+					else
+						SetSelection(FindEnabledIdx(mSelectIdx + 1, 1));
+				case .PageUp:
+					if (!mItemWidgets.IsEmpty)
+					{
+						int32 itemsPerPage = (int32)Math.Ceiling((mParent.mHeight - 8) / mItemWidgets[0].mHeight) - 1;
+						SetSelection(FindEnabledIdx(Math.Max(0, mSelectIdx - itemsPerPage), 1));
+					}
+				case .PageDown:
+					if (!mItemWidgets.IsEmpty)
+					{
+						int32 itemsPerPage = (int32)Math.Ceiling((mParent.mHeight - 8) / mItemWidgets[0].mHeight) - 1;
+						SetSelection(FindEnabledIdx(Math.Min(mItemWidgets.Count - 1, Math.Max(0, mSelectIdx) + itemsPerPage), -1));
+					}
+				case .Return:
+					if (IsSelectionSubmittable)
+						SubmitSelection();
+				default:
+					base.KeyDown(keyCode, isRepeat);
+				}
+			}
+
 			public override void Update()
 			{
 				base.Update();
@@ -39,14 +108,22 @@ namespace IDE.ui
 				String label = scope .();
 				call.GetDisplayName(label);
 				var item = menu.AddItem(label);
+
 				// StepIntoSpecific steps in unfiltered - the icon just hints that a step filter applies
 				if ((call.mIsFiltered) || (call.mIsDefaultFiltered))
 					item.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilter);
-				int callAddr = call.mAddr;
-				item.mOnMenuItemSelected.Add(new (menu) =>
-					{
-						gApp.StepIntoSpecific(callAddr);
-					});
+
+				if (call.mIsPastAddr)
+					item.mDisabled = true;
+				else
+				{
+					int callAddr = call.mAddr;
+					item.mOnMenuItemSelected.Add(new (menu) =>
+						{
+							gApp.StepIntoSpecific(callAddr);
+						});
+				}
+
 			}
 
 			mMenuWidget = new StepIntoSpecificMenuWidget(menu);
@@ -54,11 +131,13 @@ namespace IDE.ui
 			mMenuWidget.Init(ewc, x, y);
 			mMenuWidget.mWidgetWindow.mOnWindowKeyDown.Add(new => gApp.[Friend]SysKeyDown);
 			mMenuWidget.mOnRemovedFromParent.Add(new (widget, prevParent, widgetWindow) => Closed());
-			mMenuWidget.SetSelection(0);
+			mMenuWidget.SelectFirstEnabled();
 		}
 
 		public void Submit()
 		{
+			if (!mMenuWidget.IsSelectionSubmittable)
+				return;
 			mMenuWidget.SubmitSelection();
 		}
 

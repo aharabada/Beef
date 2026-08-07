@@ -5139,7 +5139,7 @@ namespace IDE.ui
 						menuItem.SetDisabled(!isPaused);
 						menuItem.mOnMenuItemSelected.Add(new (evt) => IDEApp.sApp.[Friend]SetNextStatement());
 
-					    var stepIntoSpecificMenu = menu.AddItem("Step into Specific");
+					    var stepIntoSpecificMenu = gApp.AddMenuItem(menu, "Step into Specific");
 						stepIntoSpecificMenu.SetDisabled(!isPaused);
 						stepIntoSpecificMenu.IsParent = true;
 					    var stepFilterMenu = menu.AddItem("Step Filter");
@@ -5156,6 +5156,9 @@ namespace IDE.ui
 
 							for (var call in lineCalls)
 							{
+								if (!gApp.mSettings.mDebuggerSettings.mShowAlreadyExecutedCalls && call.mIsPastAddr)
+									continue;
+
 								String displayName = scope .();
 								call.GetDisplayName(displayName);
 								Menu callMenuItem = stepIntoSpecificMenu.AddItem(displayName);

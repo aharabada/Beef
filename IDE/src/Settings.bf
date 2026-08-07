@@ -164,6 +164,7 @@ namespace IDE
 			public bool mAutoEvaluatePropertiesOnHover = false;
 			public bool mAutoRefreshWatches = false;
 			public bool mAlwaysStepIntoSpecific = false;
+			public bool mShowAlreadyExecutedCalls = false;
 
 			public void Serialize(StructuredData sd)
 			{
@@ -208,6 +209,7 @@ namespace IDE
 				sd.Add("AutoEvaluateProperties", mAutoEvaluatePropertiesOnHover);
 				sd.Add("AutoRefreshWatches", mAutoRefreshWatches);
 				sd.Add("AlwaysStepIntoSpecific", mAlwaysStepIntoSpecific);
+				sd.Add("ShowAlreadyExecutedCalls", mShowAlreadyExecutedCalls);
 			}
 
 			public void Deserialize(StructuredData sd)
@@ -250,6 +252,7 @@ namespace IDE
 				sd.Get("AutoEvaluateProperties", ref mAutoEvaluatePropertiesOnHover);
 				sd.Get("AutoRefreshWatches", ref mAutoRefreshWatches);
 				sd.Get("AlwaysStepIntoSpecific", ref mAlwaysStepIntoSpecific);
+				sd.Get("ShowAlreadyExecutedCalls", ref mShowAlreadyExecutedCalls);
 			}
 
 			public void Apply()
@@ -979,7 +982,7 @@ namespace IDE
 				Add("Start Without Debugging", "Ctrl+F5");
 				Add("Start Without Compiling", "Alt+F5");
 				Add("Step Into", "F11");
-				Add("Step Into Specific", "Alt+F11");
+				Add("Step into Specific", "Alt+F11");
 				Add("Step Out", "Shift+F11");
 				Add("Step Over", "F10");
 				Add("Stop Debugging", "Shift+F5");

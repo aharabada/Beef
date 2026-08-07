@@ -4987,7 +4987,7 @@ namespace IDE
 			List<DebugManager.LineCall> candidates = scope .();
 			for (var call in lineCalls)
 			{
-				if (!call.mIsPastAddr)
+				if (mSettings.mDebuggerSettings.mShowAlreadyExecutedCalls || !call.mIsPastAddr)
 					candidates.Add(call);
 			}
 
@@ -6425,7 +6425,7 @@ namespace IDE
 			subMenu.AddMenuItem("&Profile", "Profile", new => UpdateMenuItem_HasWorkspace);
 			subMenu.AddMenuItem(null);
 			subMenu.AddMenuItem("Step Into", "Step Into", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
-			subMenu.AddMenuItem("Step Into Specific", "Step Into Specific", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
+			subMenu.AddMenuItem("Step into Specific", "Step into Specific", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
 			subMenu.AddMenuItem("Step Over", "Step Over", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
 			subMenu.AddMenuItem("Step Out", "Step Out", new => UpdateMenuItem_DebugPaused);
 			subMenu.AddMenuItem(null);
