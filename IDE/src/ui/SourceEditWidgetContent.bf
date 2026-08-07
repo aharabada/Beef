@@ -818,6 +818,7 @@ namespace IDE.ui
 		FastCursorState mFastCursorState ~ delete _;
 		public HashSet<int32> mCurParenPairIdSet = new .() ~ delete _;
 		HilitePairedCharState mHilitePairedCharState = .NeedToRecalculate;
+		public StepIntoSpecificHilite mStepIntoSpecificHilite ~ delete _;
 		public Dictionary<int32, CollapseEntry> mCollapseMap = new .() ~ delete _;
 		public List<CollapseEntry*> mOrderedCollapseEntries = new .() ~ delete _;
 		public List<String> mCollapseTypeNames = new .() ~ DeleteContainerAndItems!(_);
@@ -4628,6 +4629,18 @@ namespace IDE.ui
 			}
 		}
 
+		public void CancelStepIntoSpecificHilite()
+		{
+			DeleteAndNullify!(mStepIntoSpecificHilite);
+		}
+
+		public bool TryShowStepIntoSpecificHilite(List<DebugManager.LineCall> calls)
+		{
+			CancelStepIntoSpecificHilite();
+			mStepIntoSpecificHilite = StepIntoSpecificHilite.TryCreate(this, calls);
+			return mStepIntoSpecificHilite != null;
+		}
+
 		public override void HandleKey(KeyCode keyCode, KeyFlags keyFlags, bool isRepeat)
 		{
 			bool shiftDown = keyFlags.HasFlag(.Shift);
@@ -4638,6 +4651,48 @@ namespace IDE.ui
 			mEmbedSelected = null;
 
 			bool autoCompleteRequireControl = (gApp.mSettings.mEditorSettings.mAutoCompleteRequireControl) && (mIsMultiline);
+
+			if ((mStepIntoSpecificHilite != null) && (IsPrimaryTextCursor()))
+			{
+				bool keepHilite = false;
+				switch (keyCode)
+				{
+				case .Escape:
+					CancelStepIntoSpecificHilite();
+					return;
+				case .Left, .Up:
+					if ((!autoCompleteRequireControl) || (ctrlDown))
+					{
+						mStepIntoSpecificHilite.CycleSelection(-1);
+						return;
+					}
+					keepHilite = true; // Plain arrows move the cursor, the hilite stays active
+				case .Right, .Down:
+					if ((!autoCompleteRequireControl) || (ctrlDown))
+					{
+						mStepIntoSpecificHilite.CycleSelection(1);
+						return;
+					}
+					keepHilite = true;
+				case .Tab:
+					if (!autoCompleteRequireControl)
+					{
+						mIgnoreKeyChar = true;
+						mStepIntoSpecificHilite.CycleSelection(shiftDown ? -1 : 1);
+						return;
+					}
+					// With "require control" Tab counts as a typing key - cancel and edit normally
+				case .Return:
+					mIgnoreKeyChar = true;
+					mStepIntoSpecificHilite.Submit();
+					return;
+				case .Control, .Shift, .Alt, .Command:
+					keepHilite = true; // Bare modifiers never cancel
+				default:
+				}
+				if (!keepHilite)
+					CancelStepIntoSpecificHilite(); // Any other key cancels the mode and then acts normally
+			}
 
 			if (((keyCode == .Up) || (keyCode == .Down)) &&
 				(mAutoComplete != null) && (mAutoComplete.IsShowing()) && (mAutoComplete.mListWindow != null) &&
@@ -5280,6 +5335,9 @@ namespace IDE.ui
 
 		public override void MouseDown(float x, float y, int32 btn, int32 btnCount)
 		{
+			if (mStepIntoSpecificHilite != null)
+				CancelStepIntoSpecificHilite();
+
 			int line = GetLineAt(y);
 			if (mEmbeds.GetValue((.)line) case .Ok(let embed))
 			{
@@ -5760,6 +5818,9 @@ namespace IDE.ui
         public override void Update()
         {
             base.Update();
+
+			if ((mStepIntoSpecificHilite != null) && (!mStepIntoSpecificHilite.CheckValid()))
+				CancelStepIntoSpecificHilite();
 
             if (mAutoComplete != null)
 			{
@@ -6508,6 +6569,9 @@ namespace IDE.ui
 					}
 				}
 			}
+
+			if (mStepIntoSpecificHilite != null)
+				mStepIntoSpecificHilite.Draw(g);
 
             using (g.PushTranslate(mTextInsets.mLeft, mTextInsets.mTop))
             {

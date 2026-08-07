@@ -4925,9 +4925,28 @@ namespace IDE
 			CompileAndRun(true);
 		}
 
+		SourceEditWidgetContent GetStepIntoSpecificHiliteEwc()
+		{
+			var sourceViewPanel = GetActiveSourceViewPanel();
+			if (sourceViewPanel == null)
+				return null;
+			var ewc = sourceViewPanel.mEditWidget.mEditWidgetContent as SourceEditWidgetContent;
+			if ((ewc != null) && (ewc.mStepIntoSpecificHilite != null))
+				return ewc;
+			return null;
+		}
+
 		[IDECommand]
 		void StepInto()
 		{
+			var hiliteEwc = GetStepIntoSpecificHiliteEwc();
+			if (hiliteEwc != null)
+			{
+				// The Step Into hotkey confirms the pending inline selection
+				hiliteEwc.mStepIntoSpecificHilite.Submit();
+				return;
+			}
+
 			if (mStepIntoSpecificSelector != null)
 			{
 				// The Step Into hotkey confirms the pending step into specific selection
@@ -4965,6 +4984,14 @@ namespace IDE
 		[IDECommand]
 		void StepIntoSpecific()
 		{
+			var hiliteEwc = GetStepIntoSpecificHiliteEwc();
+			if (hiliteEwc != null)
+			{
+				// Pressing the hotkey again confirms the selection
+				hiliteEwc.mStepIntoSpecificHilite.Submit();
+				return;
+			}
+
 			if (mStepIntoSpecificSelector != null)
 			{
 				// Pressing the hotkey again confirms the selection
@@ -5018,6 +5045,12 @@ namespace IDE
 			}
 
 			var ewc = (SourceEditWidgetContent)sourceViewPanel.mEditWidget.mEditWidgetContent;
+
+			// Inline call-token highlighting (Beef sources only); the popup remains the fallback
+			if ((sourceViewPanel.mIsBeefSource) &&
+				(ewc.TryShowStepIntoSpecificHilite(candidates)))
+				return;
+
 			ewc.GetTextCoordAtCursor(var x, var y);
 			// GetTextCoordAtCursor returns the top of the line - open the popup below it
 			y += ewc.GetLineHeight(0);
