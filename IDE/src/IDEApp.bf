@@ -4985,21 +4985,27 @@ namespace IDE
 
 			// Only calls we haven't passed yet are candidates
 			List<DebugManager.LineCall> candidates = scope .();
+			int validCandidates = 0;
 			for (var call in lineCalls)
 			{
 				if (mSettings.mDebuggerSettings.mShowAlreadyExecutedCalls || !call.mIsPastAddr)
+				{
 					candidates.Add(call);
+
+					if (!call.mIsPastAddr)
+						validCandidates++;
+				}
 			}
 
-			if (candidates.IsEmpty)
+			if (candidates.IsEmpty || validCandidates == 0)
 			{
 				DoStepInto();
 				return;
 			}
 
-			if (candidates.Count == 1)
+			if (validCandidates == 1)
 			{
-				StepIntoSpecific(candidates[0].mAddr);
+				StepIntoSpecific(candidates.Back.mAddr);
 				return;
 			}
 
