@@ -333,6 +333,7 @@ namespace IDE.ui
 			AddPropertiesItem(root, "Profile Sample Rate", "mProfileSampleRate");
 			AddPropertiesItem(root, "Auto Eval Properties on Hover", "mAutoEvaluatePropertiesOnHover");
 			AddPropertiesItem(root, "Auto Refresh Side Effects", "mAutoRefreshWatches");
+			AddPropertiesItem(root, "Always do Step Into Specific", "mAlwaysStepIntoSpecific");
 		}
 
 		protected override void ResetSettings()

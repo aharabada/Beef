@@ -203,6 +203,7 @@ namespace IDE
 
 		public WidgetWindow mPopupWindow;
 		public RecentFileSelector mRecentFileSelector;
+		public StepIntoSpecificSelector mStepIntoSpecificSelector;
 
 		public IDETabbedView mActiveDocumentsTabbedView;
 		public static new IDEApp sApp;
@@ -4927,6 +4928,26 @@ namespace IDE
 		[IDECommand]
 		void StepInto()
 		{
+			if (mStepIntoSpecificSelector != null)
+			{
+				// The Step Into hotkey confirms the pending step into specific selection
+				mStepIntoSpecificSelector.Submit();
+				return;
+			}
+
+			if ((mSettings.mDebuggerSettings.mAlwaysStepIntoSpecific) &&
+				(mDebugger.mIsRunning) && (mExecutionPaused) && (mDebugger.IsPaused()) &&
+				(!IsInDisassemblyMode()))
+			{
+				StepIntoSpecific();
+				return;
+			}
+
+			DoStepInto();
+		}
+
+		void DoStepInto()
+		{
 			if (mDebugger.mIsRunning)
 			{
 				if ((mExecutionPaused) && (mDebugger.IsPaused()))
@@ -4939,6 +4960,65 @@ namespace IDE
 			{
 				RunWithStep();
 			}
+		}
+
+		[IDECommand]
+		void StepIntoSpecific()
+		{
+			if (mStepIntoSpecificSelector != null)
+			{
+				// Pressing the hotkey again confirms the selection
+				mStepIntoSpecificSelector.Submit();
+				return;
+			}
+
+			if ((!mDebugger.mIsRunning) || (!mExecutionPaused) || (!mDebugger.IsPaused()) ||
+				(IsInDisassemblyMode()))
+			{
+				DoStepInto();
+				return;
+			}
+
+			List<DebugManager.LineCall> lineCalls = scope .();
+			defer ClearAndDeleteItems(lineCalls);
+			mDebugger.GetLineCallsOfActiveStackFrame(lineCalls);
+
+			// Only calls we haven't passed yet are candidates
+			List<DebugManager.LineCall> candidates = scope .();
+			for (var call in lineCalls)
+			{
+				if (!call.mIsPastAddr)
+					candidates.Add(call);
+			}
+
+			if (candidates.IsEmpty)
+			{
+				DoStepInto();
+				return;
+			}
+
+			if (candidates.Count == 1)
+			{
+				StepIntoSpecific(candidates[0].mAddr);
+				return;
+			}
+
+			ShowPCLocation(mDebugger.mActiveCallStackIdx, false, true);
+			var sourceViewPanel = GetActiveSourceViewPanel();
+			if (sourceViewPanel == null)
+			{
+				DoStepInto();
+				return;
+			}
+
+			var ewc = (SourceEditWidgetContent)sourceViewPanel.mEditWidget.mEditWidgetContent;
+			ewc.GetTextCoordAtCursor(var x, var y);
+			// GetTextCoordAtCursor returns the top of the line - open the popup below it
+			y += ewc.GetLineHeight(0);
+			ewc.[Friend]ClampMenuCoords(ref x, ref y);
+
+			mStepIntoSpecificSelector = new StepIntoSpecificSelector();
+			mStepIntoSpecificSelector.Show(ewc, x, y, candidates);
 		}
 
 		[IDECommand]
@@ -6345,6 +6425,7 @@ namespace IDE
 			subMenu.AddMenuItem("&Profile", "Profile", new => UpdateMenuItem_HasWorkspace);
 			subMenu.AddMenuItem(null);
 			subMenu.AddMenuItem("Step Into", "Step Into", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
+			subMenu.AddMenuItem("Step Into Specific", "Step Into Specific", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
 			subMenu.AddMenuItem("Step Over", "Step Over", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
 			subMenu.AddMenuItem("Step Out", "Step Out", new => UpdateMenuItem_DebugPaused);
 			subMenu.AddMenuItem(null);

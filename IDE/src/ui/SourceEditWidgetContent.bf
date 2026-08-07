@@ -5148,106 +5148,74 @@ namespace IDE.ui
 
 						if (isPaused)
 						{
-						    int addr;
-						    String file = scope String();
-							String stackFrameInfo = scope String();
-						    debugger.GetStackFrameInfo(debugger.mActiveCallStackIdx, out addr, file, stackFrameInfo);
-						    if (addr != (int)0)
-						    {
-						        HashSet<String> foundFilters = scope HashSet<String>();
+							HashSet<String> foundFilters = scope HashSet<String>();
 
-						        String lineCallAddrs = scope String();
-								var checkAddr = addr;
-								if (debugger.mActiveCallStackIdx > 0)
-									checkAddr--; // Bump back to an address in a calling instruction
+							List<DebugManager.LineCall> lineCalls = scope .();
+							defer ClearAndDeleteItems(lineCalls);
+							debugger.GetLineCallsOfActiveStackFrame(lineCalls);
 
-								if (debugger.mActiveCallStackIdx > 0)
-									checkAddr = debugger.GetStackFrameCalleeAddr(debugger.mActiveCallStackIdx);
+							for (var call in lineCalls)
+							{
+								String displayName = scope .();
+								call.GetDisplayName(displayName);
+								Menu callMenuItem = stepIntoSpecificMenu.AddItem(displayName);
 
-						        debugger.FindLineCallAddresses(checkAddr, lineCallAddrs);
-						        for (var callStr in String.StackSplit!(lineCallAddrs, '\n'))
-						        {
-						            if (!String.IsNullOrEmpty(callStr))
-						            {
-						                Menu callMenuItem;
+								if (call.mName != null)
+								{
+									String name = call.mName;
+									StepFilter stepFilter = null;
+									debugger.mStepFilterList.TryGetValue(name, out stepFilter);
 
-						                var callData = String.StackSplit!(callStr, '\t');
-						                String callInstLocStr = callData[0];
-										bool isPastAddr = false;
-										if (callInstLocStr[0] == '-')
+									bool isDefaultFiltered = call.mIsDefaultFiltered;
+
+									if (!foundFilters.Contains(name))
+									{
+										foundFilters.Add(scope:: String(name));
+										var filteredItem = stepFilterMenu.AddItem(name);
+										for (int32 scopeIdx = 0; scopeIdx < 2; scopeIdx++)
 										{
-											callInstLocStr.Remove(0);
-											isPastAddr = true;
-										}
-						                int callInstLoc = (int)int64.Parse(callInstLocStr, System.Globalization.NumberStyles.HexNumber);
-						                if (callData.Count == 1)
-						                {
-						                    callMenuItem = stepIntoSpecificMenu.AddItem(scope String()..AppendF("Indirect call at 0x{0:X}", callInstLoc));
-						                }
-						                else
-						                {
-						                    String name = callData[1];
-						                    StepFilter stepFilter = null;
-
-											debugger.mStepFilterList.TryGetValue(name, out stepFilter);
-
-											bool isDefaultFiltered = false;
-											if (callData.Count >= 3)
+											bool isGlobal = scopeIdx != 0;
+											var scopeItem = filteredItem.AddItem((scopeIdx == 0) ? "Workspace" : "Global");
+											if ((stepFilter != null) && (stepFilter.mIsGlobal == isGlobal))
 											{
-												if (callData[2].Contains('d'))
-													isDefaultFiltered = true;
+												if (stepFilter.mKind == .Filtered)
+													scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilter);
+												else
+													scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.LinePointer);
+												filteredItem.mIconImage = scopeItem.mIconImage;
+												scopeItem.mOnMenuItemSelected.Add(new (evt) =>
+													{
+														debugger.DeleteStepFilter(stepFilter);
+													});
 											}
+											else
+											{
+												if (isDefaultFiltered)
+												{
+													scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilteredDefault);
+													filteredItem.mIconImage = scopeItem.mIconImage;
+												}
 
-						                    callMenuItem = stepIntoSpecificMenu.AddItem(name);
+												String nameCopy = new String(name);
+												scopeItem.mOnMenuItemSelected.Add(new (evt) =>
+													{
+														debugger.CreateStepFilter(nameCopy, isGlobal, isDefaultFiltered ? .NotFiltered : .Filtered);
+													}
+													~ delete nameCopy
+													);
+											}
+										}
+									}
+								}
 
-						                    if (!foundFilters.Contains(name))
-						                    {
-						                        foundFilters.Add(scope:: String(name));
-						                        var filteredItem = stepFilterMenu.AddItem(name);
-						                        for (int32 scopeIdx = 0; scopeIdx < 2; scopeIdx++)
-						                        {
-						                            bool isGlobal = scopeIdx != 0;
-						                            var scopeItem = filteredItem.AddItem((scopeIdx == 0) ? "Workspace" : "Global");
-						                            if ((stepFilter != null) && (stepFilter.mIsGlobal == isGlobal))
-						                            {
-														if (stepFilter.mKind == .Filtered)
-						                                	scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilter);
-														else
-															scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.LinePointer);
-						                                filteredItem.mIconImage = scopeItem.mIconImage;
-						                                scopeItem.mOnMenuItemSelected.Add(new (evt) =>
-						                                    {
-						                                        debugger.DeleteStepFilter(stepFilter);
-						                                    });
-						                            }
-						                            else
-						                            {
-														if (isDefaultFiltered)
-														{
-															scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilteredDefault);
-															filteredItem.mIconImage = scopeItem.mIconImage;
-														}
+								if (call.mIsPastAddr)
+									callMenuItem.mDisabled = true;
 
-														String nameCopy = new String(name);
-						                                scopeItem.mOnMenuItemSelected.Add(new (evt) =>
-						                                    {
-						                                        debugger.CreateStepFilter(nameCopy, isGlobal, isDefaultFiltered ? .NotFiltered : .Filtered);
-						                                    }
-						                                    ~ delete nameCopy
-						                                    );
-						                            }
-						                        }
-						                    }
-						                }
-										if (isPastAddr)
-											callMenuItem.mDisabled = true ;
-
-						                callMenuItem.mOnMenuItemSelected.Add(new (evt) =>
-						                    {
-						                        IDEApp.sApp.StepIntoSpecific(callInstLoc);                                            
-						                    });
-						            }
-						        }
+								int callAddr = call.mAddr;
+								callMenuItem.mOnMenuItemSelected.Add(new (evt) =>
+									{
+										IDEApp.sApp.StepIntoSpecific(callAddr);
+									});
 							}
 					    }
 

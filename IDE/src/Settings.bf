@@ -163,6 +163,7 @@ namespace IDE
 			public int32 mProfileSampleRate = 1000;
 			public bool mAutoEvaluatePropertiesOnHover = false;
 			public bool mAutoRefreshWatches = false;
+			public bool mAlwaysStepIntoSpecific = false;
 
 			public void Serialize(StructuredData sd)
 			{
@@ -206,6 +207,7 @@ namespace IDE
 				sd.Add("ProfileSampleRate", mProfileSampleRate);
 				sd.Add("AutoEvaluateProperties", mAutoEvaluatePropertiesOnHover);
 				sd.Add("AutoRefreshWatches", mAutoRefreshWatches);
+				sd.Add("AlwaysStepIntoSpecific", mAlwaysStepIntoSpecific);
 			}
 
 			public void Deserialize(StructuredData sd)
@@ -247,6 +249,7 @@ namespace IDE
 				sd.Get("ProfileSampleRate", ref mProfileSampleRate);
 				sd.Get("AutoEvaluateProperties", ref mAutoEvaluatePropertiesOnHover);
 				sd.Get("AutoRefreshWatches", ref mAutoRefreshWatches);
+				sd.Get("AlwaysStepIntoSpecific", ref mAlwaysStepIntoSpecific);
 			}
 
 			public void Apply()
@@ -976,6 +979,7 @@ namespace IDE
 				Add("Start Without Debugging", "Ctrl+F5");
 				Add("Start Without Compiling", "Alt+F5");
 				Add("Step Into", "F11");
+				Add("Step Into Specific", "Alt+F11");
 				Add("Step Out", "Shift+F11");
 				Add("Step Over", "F10");
 				Add("Stop Debugging", "Shift+F5");
