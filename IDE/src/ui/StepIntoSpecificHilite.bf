@@ -249,7 +249,7 @@ namespace IDE.ui
 			}
 		}
 
-		public static StepIntoSpecificHilite TryCreate(SourceEditWidgetContent ewc, List<DebugManager.LineCall> calls)
+		public static StepIntoSpecificHilite Create(SourceEditWidgetContent ewc, List<DebugManager.LineCall> calls)
 		{
 			int line = ewc.CursorLineAndColumn.mLine;
 
@@ -259,9 +259,7 @@ namespace IDE.ui
 
 			List<Span> spans = scope .();
 			List<Entry> entries = scope .();
-			int matchedCount = 0;
-			bool hasSelectable = false;
-
+			
 			for (var call in calls)
 			{
 				Entry entry;
@@ -271,9 +269,6 @@ namespace IDE.ui
 				entry.mMenuLabel = null;
 				entry.mSpanIdx = -1;
 				entry.mMenuRowIdx = -1;
-
-				if (!call.mIsPastAddr)
-					hasSelectable = true;
 
 				bool matched = false;
 				if (call.mName != null)
@@ -309,15 +304,8 @@ namespace IDE.ui
 					}
 				}
 
-				if (matched)
-					matchedCount++;
 				entries.Add(entry);
 			}
-
-			// Without a single matched token there is nothing to show inline - and without a
-			// selectable candidate there is nothing to step into. The classic popup handles both.
-			if ((matchedCount == 0) || (!hasSelectable))
-				return null;
 
 			spans.Sort(scope (lhs, rhs) => lhs.mTextIdx <=> rhs.mTextIdx);
 			for (int32 spanIdx < (int32)spans.Count)

@@ -203,7 +203,6 @@ namespace IDE
 
 		public WidgetWindow mPopupWindow;
 		public RecentFileSelector mRecentFileSelector;
-		public StepIntoSpecificSelector mStepIntoSpecificSelector;
 
 		public IDETabbedView mActiveDocumentsTabbedView;
 		public static new IDEApp sApp;
@@ -4947,13 +4946,6 @@ namespace IDE
 				return;
 			}
 
-			if (mStepIntoSpecificSelector != null)
-			{
-				// The Step Into hotkey confirms the pending step into specific selection
-				mStepIntoSpecificSelector.Submit();
-				return;
-			}
-
 			if ((mSettings.mDebuggerSettings.mAlwaysStepIntoSpecific) &&
 				(mDebugger.mIsRunning) && (mExecutionPaused) && (mDebugger.IsPaused()) &&
 				(!IsInDisassemblyMode()))
@@ -4992,13 +4984,6 @@ namespace IDE
 				return;
 			}
 
-			if (mStepIntoSpecificSelector != null)
-			{
-				// Pressing the hotkey again confirms the selection
-				mStepIntoSpecificSelector.Submit();
-				return;
-			}
-
 			if ((!mDebugger.mIsRunning) || (!mExecutionPaused) || (!mDebugger.IsPaused()) ||
 				(IsInDisassemblyMode()))
 			{
@@ -5010,9 +4995,10 @@ namespace IDE
 			defer ClearAndDeleteItems(lineCalls);
 			mDebugger.GetLineCallsOfActiveStackFrame(lineCalls);
 
-			// Only calls we haven't passed yet are candidates
 			List<DebugManager.LineCall> candidates = scope .();
+			// Only calls we haven't passed yet are valid candidates
 			int validCandidates = 0;
+			DebugManager.LineCall firstValidCandidate = null;
 			for (var call in lineCalls)
 			{
 				if (mSettings.mDebuggerSettings.mShowAlreadyExecutedCalls || !call.mIsPastAddr)
@@ -5020,7 +5006,11 @@ namespace IDE
 					candidates.Add(call);
 
 					if (!call.mIsPastAddr)
+					{
 						validCandidates++;
+
+						firstValidCandidate ??= call;
+					}
 				}
 			}
 
@@ -5032,7 +5022,7 @@ namespace IDE
 
 			if (validCandidates == 1)
 			{
-				StepIntoSpecific(candidates.Back.mAddr);
+				StepIntoSpecific(firstValidCandidate.mAddr);
 				return;
 			}
 
@@ -5045,21 +5035,7 @@ namespace IDE
 			}
 
 			var ewc = (SourceEditWidgetContent)sourceViewPanel.mEditWidget.mEditWidgetContent;
-
-			ewc.GetTextCoordAtCursor(var x, var y);
-			// GetTextCoordAtCursor returns the top of the line - open any dropdown below it
-			y += ewc.GetLineHeight(0);
-			ewc.[Friend]ClampMenuCoords(ref x, ref y);
-
-			// Hybrid inline hilite (Beef sources only): matched candidates get inline spans,
-			// unmatched ones a simultaneous passive dropdown. The focused popup remains the
-			// fallback when nothing matched.
-			if ((sourceViewPanel.mIsBeefSource) &&
-				(ewc.TryShowStepIntoSpecificHilite(candidates, x, y)))
-				return;
-
-			mStepIntoSpecificSelector = new StepIntoSpecificSelector();
-			mStepIntoSpecificSelector.Show(ewc, x, y, candidates);
+			ewc.ShowStepIntoSpecificHilite(candidates);
 		}
 
 		[IDECommand]

@@ -4634,14 +4634,17 @@ namespace IDE.ui
 			DeleteAndNullify!(mStepIntoSpecificHilite);
 		}
 
-		public bool TryShowStepIntoSpecificHilite(List<DebugManager.LineCall> calls, float menuX, float menuY)
+		public void ShowStepIntoSpecificHilite(List<DebugManager.LineCall> calls)
 		{
 			CancelStepIntoSpecificHilite();
-			mStepIntoSpecificHilite = StepIntoSpecificHilite.TryCreate(this, calls);
-			if (mStepIntoSpecificHilite == null)
-				return false;
+
+			GetTextCoordAtCursor(var menuX, var menuY);
+			// GetTextCoordAtCursor returns the top of the line - open any dropdown below it
+			menuY += GetLineHeight(0);
+			ClampMenuCoords(ref menuX, ref menuY);
+
+			mStepIntoSpecificHilite = StepIntoSpecificHilite.Create(this, calls);
 			mStepIntoSpecificHilite.ShowMenuIfNeeded(menuX, menuY);
-			return true;
 		}
 
 		public override void HandleKey(KeyCode keyCode, KeyFlags keyFlags, bool isRepeat)
