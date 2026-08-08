@@ -376,6 +376,9 @@ namespace IDE
 			public Color mCharPairHilite = 0x1DFFFFFF;
 			public Color mCodeHilite = 0xFF384858;
 			public Color mCodeHiliteUnfocused = 0x80384858;
+			public Color mPastStepIntoHilite = 0x5D907090;
+			public Color mStepIntoHilite = 0x5D671471;
+			public Color mStepIntoOutline = 0xFFBD37D3;
 
 			public void Deserialize(StructuredData sd)
 			{
@@ -455,6 +458,9 @@ namespace IDE
 				GetColor("CharPairHilite", ref mCharPairHilite);
 				GetColor("CodeHilite", ref mCodeHilite);
 				GetColor("CodeHiliteUnfocused", ref mCodeHiliteUnfocused);
+				GetColor("PastStepIntoHilite", ref mPastStepIntoHilite);
+				GetColor("StepIntoHilite", ref mStepIntoHilite);
+				GetColor("StepIntoOutline", ref mStepIntoOutline);
 			}
 
 			public void Apply()
@@ -498,6 +504,10 @@ namespace IDE
 				DarkTheme.COLOR_MENU_SELECTED = mMenuSelected;
 				DarkTheme.COLOR_CURRENT_LINE_HILITE = mCurrentLineHilite;
 				DarkTheme.COLOR_CHAR_PAIR_HILITE = mCharPairHilite;
+				
+				DarkTheme.COLOR_PAST_STEP_INTO_HILITE = mPastStepIntoHilite;
+				DarkTheme.COLOR_STEP_INTO_HILITE = mStepIntoHilite;
+				DarkTheme.COLOR_STEP_INTO_OUTLINE = mStepIntoOutline;
 			}
 		}
 

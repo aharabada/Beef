@@ -4634,11 +4634,14 @@ namespace IDE.ui
 			DeleteAndNullify!(mStepIntoSpecificHilite);
 		}
 
-		public bool TryShowStepIntoSpecificHilite(List<DebugManager.LineCall> calls)
+		public bool TryShowStepIntoSpecificHilite(List<DebugManager.LineCall> calls, float menuX, float menuY)
 		{
 			CancelStepIntoSpecificHilite();
 			mStepIntoSpecificHilite = StepIntoSpecificHilite.TryCreate(this, calls);
-			return mStepIntoSpecificHilite != null;
+			if (mStepIntoSpecificHilite == null)
+				return false;
+			mStepIntoSpecificHilite.ShowMenuIfNeeded(menuX, menuY);
+			return true;
 		}
 
 		public override void HandleKey(KeyCode keyCode, KeyFlags keyFlags, bool isRepeat)
@@ -4654,44 +4657,31 @@ namespace IDE.ui
 
 			if ((mStepIntoSpecificHilite != null) && (IsPrimaryTextCursor()))
 			{
-				bool keepHilite = false;
+				bool canArrowsNavigate = (!autoCompleteRequireControl) || (ctrlDown);
+
 				switch (keyCode)
 				{
-				case .Escape:
-					CancelStepIntoSpecificHilite();
-					return;
 				case .Left, .Up:
-					if ((!autoCompleteRequireControl) || (ctrlDown))
+					if (canArrowsNavigate)
 					{
 						mStepIntoSpecificHilite.CycleSelection(-1);
 						return;
 					}
-					keepHilite = true; // Plain arrows move the cursor, the hilite stays active
 				case .Right, .Down:
-					if ((!autoCompleteRequireControl) || (ctrlDown))
+					if (canArrowsNavigate)
 					{
 						mStepIntoSpecificHilite.CycleSelection(1);
 						return;
 					}
-					keepHilite = true;
-				case .Tab:
-					if (!autoCompleteRequireControl)
-					{
-						mIgnoreKeyChar = true;
-						mStepIntoSpecificHilite.CycleSelection(shiftDown ? -1 : 1);
-						return;
-					}
-					// With "require control" Tab counts as a typing key - cancel and edit normally
 				case .Return:
 					mIgnoreKeyChar = true;
 					mStepIntoSpecificHilite.Submit();
 					return;
 				case .Control, .Shift, .Alt, .Command:
-					keepHilite = true; // Bare modifiers never cancel
+					// Bare modifiers never cancel
 				default:
+					CancelStepIntoSpecificHilite();
 				}
-				if (!keepHilite)
-					CancelStepIntoSpecificHilite(); // Any other key cancels the mode and then acts normally
 			}
 
 			if (((keyCode == .Up) || (keyCode == .Down)) &&
@@ -6571,7 +6561,7 @@ namespace IDE.ui
 			}
 
 			if (mStepIntoSpecificHilite != null)
-				mStepIntoSpecificHilite.Draw(g);
+				mStepIntoSpecificHilite.DrawHilites(g);
 
             using (g.PushTranslate(mTextInsets.mLeft, mTextInsets.mTop))
             {
@@ -6610,6 +6600,9 @@ namespace IDE.ui
 					}
 				}
 			}
+			
+			if (mStepIntoSpecificHilite != null)
+				mStepIntoSpecificHilite.DrawBadges(g);
         }
 
 		public override void Resize(float x, float y, float width, float height)

@@ -5046,15 +5046,17 @@ namespace IDE
 
 			var ewc = (SourceEditWidgetContent)sourceViewPanel.mEditWidget.mEditWidgetContent;
 
-			// Inline call-token highlighting (Beef sources only); the popup remains the fallback
-			if ((sourceViewPanel.mIsBeefSource) &&
-				(ewc.TryShowStepIntoSpecificHilite(candidates)))
-				return;
-
 			ewc.GetTextCoordAtCursor(var x, var y);
-			// GetTextCoordAtCursor returns the top of the line - open the popup below it
+			// GetTextCoordAtCursor returns the top of the line - open any dropdown below it
 			y += ewc.GetLineHeight(0);
 			ewc.[Friend]ClampMenuCoords(ref x, ref y);
+
+			// Hybrid inline hilite (Beef sources only): matched candidates get inline spans,
+			// unmatched ones a simultaneous passive dropdown. The focused popup remains the
+			// fallback when nothing matched.
+			if ((sourceViewPanel.mIsBeefSource) &&
+				(ewc.TryShowStepIntoSpecificHilite(candidates, x, y)))
+				return;
 
 			mStepIntoSpecificSelector = new StepIntoSpecificSelector();
 			mStepIntoSpecificSelector.Show(ewc, x, y, candidates);
