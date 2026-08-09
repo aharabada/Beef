@@ -4092,12 +4092,18 @@ void BfAutoComplete::FixitCheckNamespace(BfTypeDef* activeTypeDef, BfAstNode* ty
 
 	if (hasNamespace)
 	{
-		AddEntry(AutoCompleteEntry("fixit", StrFormat("Remove unneeded '%s'\taddMethod|%s-%d|", typeRef->ToString().c_str(),
+		AddEntry(AutoCompleteEntry("fixit", StrFormat("Remove unneeded '%s'\tdelete|%s-%d|", typeRef->ToString().c_str(),
 			FixitGetLocation(parserData, typeRef->GetSrcStart()).c_str(), nextDotToken->GetSrcEnd() - typeRef->GetSrcStart()).c_str()));
 	}
 	else
 	{
-		FixitAddNamespace(typeRef, namespaceString);
+		BfUsingFinder usingFinder;
+		usingFinder.mFromIdx = typeRef->mSrcStart;
+		usingFinder.VisitMembers(typeRef->GetSourceData()->mRootNode);
+		
+		AddEntry(AutoCompleteEntry("fixit", StrFormat("using %s;\tdelete|%s-%d|\x01"".using|%s|%d||using %s;", namespaceString.c_str(),
+			FixitGetLocation(parserData, typeRef->GetSrcStart()).c_str(), nextDotToken->GetSrcEnd() - typeRef->GetSrcStart(),
+			parserData->mFileName.c_str(), usingFinder.mLastIdx, namespaceString.c_str()).c_str()));
 	}
 }
 
