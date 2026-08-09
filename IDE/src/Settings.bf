@@ -163,6 +163,9 @@ namespace IDE
 			public int32 mProfileSampleRate = 1000;
 			public bool mAutoEvaluatePropertiesOnHover = false;
 			public bool mAutoRefreshWatches = false;
+			public bool mAlwaysStepIntoSpecific = false;
+			public bool mShowAlreadyExecutedCalls = false;
+			public bool mShowFilteredCalls = true;
 
 			public void Serialize(StructuredData sd)
 			{
@@ -206,6 +209,9 @@ namespace IDE
 				sd.Add("ProfileSampleRate", mProfileSampleRate);
 				sd.Add("AutoEvaluateProperties", mAutoEvaluatePropertiesOnHover);
 				sd.Add("AutoRefreshWatches", mAutoRefreshWatches);
+				sd.Add("AlwaysStepIntoSpecific", mAlwaysStepIntoSpecific);
+				sd.Add("ShowAlreadyExecutedCalls", mShowAlreadyExecutedCalls);
+				sd.Add("ShowFilteredCalls", mShowFilteredCalls);
 			}
 
 			public void Deserialize(StructuredData sd)
@@ -247,6 +253,9 @@ namespace IDE
 				sd.Get("ProfileSampleRate", ref mProfileSampleRate);
 				sd.Get("AutoEvaluateProperties", ref mAutoEvaluatePropertiesOnHover);
 				sd.Get("AutoRefreshWatches", ref mAutoRefreshWatches);
+				sd.Get("AlwaysStepIntoSpecific", ref mAlwaysStepIntoSpecific);
+				sd.Get("ShowAlreadyExecutedCalls", ref mShowAlreadyExecutedCalls);
+				sd.Get("ShowFilteredCalls", ref mShowFilteredCalls);
 			}
 
 			public void Apply()
@@ -370,6 +379,9 @@ namespace IDE
 			public Color mCharPairHilite = 0x1DFFFFFF;
 			public Color mCodeHilite = 0xFF384858;
 			public Color mCodeHiliteUnfocused = 0x80384858;
+			public Color mPastStepIntoHilite = 0x5D907090;
+			public Color mStepIntoHilite = 0x5D671471;
+			public Color mStepIntoOutline = 0xFFBD37D3;
 
 			public void Deserialize(StructuredData sd)
 			{
@@ -449,6 +461,9 @@ namespace IDE
 				GetColor("CharPairHilite", ref mCharPairHilite);
 				GetColor("CodeHilite", ref mCodeHilite);
 				GetColor("CodeHiliteUnfocused", ref mCodeHiliteUnfocused);
+				GetColor("PastStepIntoHilite", ref mPastStepIntoHilite);
+				GetColor("StepIntoHilite", ref mStepIntoHilite);
+				GetColor("StepIntoOutline", ref mStepIntoOutline);
 			}
 
 			public void Apply()
@@ -492,6 +507,10 @@ namespace IDE
 				DarkTheme.COLOR_MENU_SELECTED = mMenuSelected;
 				DarkTheme.COLOR_CURRENT_LINE_HILITE = mCurrentLineHilite;
 				DarkTheme.COLOR_CHAR_PAIR_HILITE = mCharPairHilite;
+				
+				DarkTheme.COLOR_PAST_STEP_INTO_HILITE = mPastStepIntoHilite;
+				DarkTheme.COLOR_STEP_INTO_HILITE = mStepIntoHilite;
+				DarkTheme.COLOR_STEP_INTO_OUTLINE = mStepIntoOutline;
 			}
 		}
 
@@ -976,6 +995,7 @@ namespace IDE
 				Add("Start Without Debugging", "Ctrl+F5");
 				Add("Start Without Compiling", "Alt+F5");
 				Add("Step Into", "F11");
+				Add("Step into Specific", "Alt+F11");
 				Add("Step Out", "Shift+F11");
 				Add("Step Over", "F10");
 				Add("Stop Debugging", "Shift+F5");

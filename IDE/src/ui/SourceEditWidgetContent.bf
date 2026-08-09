@@ -818,6 +818,7 @@ namespace IDE.ui
 		FastCursorState mFastCursorState ~ delete _;
 		public HashSet<int32> mCurParenPairIdSet = new .() ~ delete _;
 		HilitePairedCharState mHilitePairedCharState = .NeedToRecalculate;
+		public StepIntoSpecificHilite mStepIntoSpecificHilite ~ delete _;
 		public Dictionary<int32, CollapseEntry> mCollapseMap = new .() ~ delete _;
 		public List<CollapseEntry*> mOrderedCollapseEntries = new .() ~ delete _;
 		public List<String> mCollapseTypeNames = new .() ~ DeleteContainerAndItems!(_);
@@ -4628,6 +4629,24 @@ namespace IDE.ui
 			}
 		}
 
+		public void CancelStepIntoSpecificHilite()
+		{
+			DeleteAndNullify!(mStepIntoSpecificHilite);
+		}
+
+		public void ShowStepIntoSpecificHilite(List<DebugManager.LineCall> calls)
+		{
+			CancelStepIntoSpecificHilite();
+
+			GetTextCoordAtCursor(var menuX, var menuY);
+			// GetTextCoordAtCursor returns the top of the line - open any dropdown below it
+			menuY += GetLineHeight(0);
+			ClampMenuCoords(ref menuX, ref menuY);
+
+			mStepIntoSpecificHilite = StepIntoSpecificHilite.Create(this, calls);
+			mStepIntoSpecificHilite.ShowMenu(menuX, menuY);
+		}
+
 		public override void HandleKey(KeyCode keyCode, KeyFlags keyFlags, bool isRepeat)
 		{
 			bool shiftDown = keyFlags.HasFlag(.Shift);
@@ -4638,6 +4657,35 @@ namespace IDE.ui
 			mEmbedSelected = null;
 
 			bool autoCompleteRequireControl = (gApp.mSettings.mEditorSettings.mAutoCompleteRequireControl) && (mIsMultiline);
+
+			if ((mStepIntoSpecificHilite != null) && (IsPrimaryTextCursor()))
+			{
+				bool canArrowsNavigate = (!autoCompleteRequireControl) || (ctrlDown);
+
+				switch (keyCode)
+				{
+				case .Left, .Up:
+					if (canArrowsNavigate)
+					{
+						mStepIntoSpecificHilite.CycleSelection(-1);
+						return;
+					}
+				case .Right, .Down:
+					if (canArrowsNavigate)
+					{
+						mStepIntoSpecificHilite.CycleSelection(1);
+						return;
+					}
+				case .Return:
+					mIgnoreKeyChar = true;
+					mStepIntoSpecificHilite.Submit();
+					return;
+				case .Control, .Shift, .Alt, .Command:
+					// Bare modifiers never cancel
+				default:
+					CancelStepIntoSpecificHilite();
+				}
+			}
 
 			if (((keyCode == .Up) || (keyCode == .Down)) &&
 				(mAutoComplete != null) && (mAutoComplete.IsShowing()) && (mAutoComplete.mListWindow != null) &&
@@ -5139,7 +5187,7 @@ namespace IDE.ui
 						menuItem.SetDisabled(!isPaused);
 						menuItem.mOnMenuItemSelected.Add(new (evt) => IDEApp.sApp.[Friend]SetNextStatement());
 
-					    var stepIntoSpecificMenu = menu.AddItem("Step into Specific");
+					    var stepIntoSpecificMenu = gApp.AddMenuItem(menu, "Step into Specific");
 						stepIntoSpecificMenu.SetDisabled(!isPaused);
 						stepIntoSpecificMenu.IsParent = true;
 					    var stepFilterMenu = menu.AddItem("Step Filter");
@@ -5148,106 +5196,77 @@ namespace IDE.ui
 
 						if (isPaused)
 						{
-						    int addr;
-						    String file = scope String();
-							String stackFrameInfo = scope String();
-						    debugger.GetStackFrameInfo(debugger.mActiveCallStackIdx, out addr, file, stackFrameInfo);
-						    if (addr != (int)0)
-						    {
-						        HashSet<String> foundFilters = scope HashSet<String>();
+							HashSet<String> foundFilters = scope HashSet<String>();
 
-						        String lineCallAddrs = scope String();
-								var checkAddr = addr;
-								if (debugger.mActiveCallStackIdx > 0)
-									checkAddr--; // Bump back to an address in a calling instruction
+							List<DebugManager.LineCall> lineCalls = scope .();
+							defer ClearAndDeleteItems(lineCalls);
+							debugger.GetLineCallsOfActiveStackFrame(lineCalls);
 
-								if (debugger.mActiveCallStackIdx > 0)
-									checkAddr = debugger.GetStackFrameCalleeAddr(debugger.mActiveCallStackIdx);
+							for (var call in lineCalls)
+							{
+								if (!gApp.mSettings.mDebuggerSettings.mShowAlreadyExecutedCalls && call.mIsPastAddr)
+									continue;
 
-						        debugger.FindLineCallAddresses(checkAddr, lineCallAddrs);
-						        for (var callStr in String.StackSplit!(lineCallAddrs, '\n'))
-						        {
-						            if (!String.IsNullOrEmpty(callStr))
-						            {
-						                Menu callMenuItem;
+								String displayName = scope .();
+								call.GetDisplayName(displayName);
+								Menu callMenuItem = stepIntoSpecificMenu.AddItem(displayName);
 
-						                var callData = String.StackSplit!(callStr, '\t');
-						                String callInstLocStr = callData[0];
-										bool isPastAddr = false;
-										if (callInstLocStr[0] == '-')
+								if (call.mName != null)
+								{
+									String name = call.mName;
+									StepFilter stepFilter = null;
+									debugger.mStepFilterList.TryGetValue(name, out stepFilter);
+
+									bool isDefaultFiltered = call.mIsDefaultFiltered;
+
+									if (!foundFilters.Contains(name))
+									{
+										foundFilters.Add(scope:: String(name));
+										var filteredItem = stepFilterMenu.AddItem(name);
+										for (int32 scopeIdx = 0; scopeIdx < 2; scopeIdx++)
 										{
-											callInstLocStr.Remove(0);
-											isPastAddr = true;
-										}
-						                int callInstLoc = (int)int64.Parse(callInstLocStr, System.Globalization.NumberStyles.HexNumber);
-						                if (callData.Count == 1)
-						                {
-						                    callMenuItem = stepIntoSpecificMenu.AddItem(scope String()..AppendF("Indirect call at 0x{0:X}", callInstLoc));
-						                }
-						                else
-						                {
-						                    String name = callData[1];
-						                    StepFilter stepFilter = null;
-
-											debugger.mStepFilterList.TryGetValue(name, out stepFilter);
-
-											bool isDefaultFiltered = false;
-											if (callData.Count >= 3)
+											bool isGlobal = scopeIdx != 0;
+											var scopeItem = filteredItem.AddItem((scopeIdx == 0) ? "Workspace" : "Global");
+											if ((stepFilter != null) && (stepFilter.mIsGlobal == isGlobal))
 											{
-												if (callData[2].Contains('d'))
-													isDefaultFiltered = true;
+												if (stepFilter.mKind == .Filtered)
+													scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilter);
+												else
+													scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.LinePointer);
+												filteredItem.mIconImage = scopeItem.mIconImage;
+												scopeItem.mOnMenuItemSelected.Add(new (evt) =>
+													{
+														debugger.DeleteStepFilter(stepFilter);
+													});
 											}
+											else
+											{
+												if (isDefaultFiltered)
+												{
+													scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilteredDefault);
+													filteredItem.mIconImage = scopeItem.mIconImage;
+												}
 
-						                    callMenuItem = stepIntoSpecificMenu.AddItem(name);
+												String nameCopy = new String(name);
+												scopeItem.mOnMenuItemSelected.Add(new (evt) =>
+													{
+														debugger.CreateStepFilter(nameCopy, isGlobal, isDefaultFiltered ? .NotFiltered : .Filtered);
+													}
+													~ delete nameCopy
+													);
+											}
+										}
+									}
+								}
 
-						                    if (!foundFilters.Contains(name))
-						                    {
-						                        foundFilters.Add(scope:: String(name));
-						                        var filteredItem = stepFilterMenu.AddItem(name);
-						                        for (int32 scopeIdx = 0; scopeIdx < 2; scopeIdx++)
-						                        {
-						                            bool isGlobal = scopeIdx != 0;
-						                            var scopeItem = filteredItem.AddItem((scopeIdx == 0) ? "Workspace" : "Global");
-						                            if ((stepFilter != null) && (stepFilter.mIsGlobal == isGlobal))
-						                            {
-														if (stepFilter.mKind == .Filtered)
-						                                	scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilter);
-														else
-															scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.LinePointer);
-						                                filteredItem.mIconImage = scopeItem.mIconImage;
-						                                scopeItem.mOnMenuItemSelected.Add(new (evt) =>
-						                                    {
-						                                        debugger.DeleteStepFilter(stepFilter);
-						                                    });
-						                            }
-						                            else
-						                            {
-														if (isDefaultFiltered)
-														{
-															scopeItem.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilteredDefault);
-															filteredItem.mIconImage = scopeItem.mIconImage;
-														}
+								if (call.mIsPastAddr)
+									callMenuItem.mDisabled = true;
 
-														String nameCopy = new String(name);
-						                                scopeItem.mOnMenuItemSelected.Add(new (evt) =>
-						                                    {
-						                                        debugger.CreateStepFilter(nameCopy, isGlobal, isDefaultFiltered ? .NotFiltered : .Filtered);
-						                                    }
-						                                    ~ delete nameCopy
-						                                    );
-						                            }
-						                        }
-						                    }
-						                }
-										if (isPastAddr)
-											callMenuItem.mDisabled = true ;
-
-						                callMenuItem.mOnMenuItemSelected.Add(new (evt) =>
-						                    {
-						                        IDEApp.sApp.StepIntoSpecific(callInstLoc);                                            
-						                    });
-						            }
-						        }
+								int callAddr = call.mAddr;
+								callMenuItem.mOnMenuItemSelected.Add(new (evt) =>
+									{
+										IDEApp.sApp.StepIntoSpecific(callAddr);
+									});
 							}
 					    }
 
@@ -5309,6 +5328,9 @@ namespace IDE.ui
 
 		public override void MouseDown(float x, float y, int32 btn, int32 btnCount)
 		{
+			if (mStepIntoSpecificHilite != null)
+				CancelStepIntoSpecificHilite();
+
 			int line = GetLineAt(y);
 			if (mEmbeds.GetValue((.)line) case .Ok(let embed))
 			{
@@ -5789,6 +5811,9 @@ namespace IDE.ui
         public override void Update()
         {
             base.Update();
+
+			if ((mStepIntoSpecificHilite != null) && (!mStepIntoSpecificHilite.CheckValid()))
+				CancelStepIntoSpecificHilite();
 
             if (mAutoComplete != null)
 			{
@@ -6538,6 +6563,9 @@ namespace IDE.ui
 				}
 			}
 
+			if (mStepIntoSpecificHilite != null)
+				mStepIntoSpecificHilite.DrawHilites(g);
+
             using (g.PushTranslate(mTextInsets.mLeft, mTextInsets.mTop))
             {
                 for (var queuedUnderline in mQueuedUnderlines)
@@ -6575,6 +6603,9 @@ namespace IDE.ui
 					}
 				}
 			}
+			
+			if (mStepIntoSpecificHilite != null)
+				mStepIntoSpecificHilite.DrawBadges(g);
         }
 
 		public override void Resize(float x, float y, float width, float height)

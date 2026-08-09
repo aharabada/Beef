@@ -7217,6 +7217,10 @@ BfTypedValue BfExprEvaluator::CreateCall(BfAstNode* targetSrc, BfMethodInstance*
 	if (((callFlags & BfCreateCallFlags_DelegateThunkStatic) != 0) && (expectCallingConvention == BfIRCallingConv_ThisCall))
 		expectCallingConvention = BfIRCallingConv_CDecl;
 
+	// Emit an expression-level source position at the invocation target name so the call
+	//  instruction gets an exact column (same-line targets only; see UpdateExprSrcPos)
+	mModule->UpdateExprSrcPos(targetSrc);
+
 	if ((methodInstance->mAlwaysInline) && (mModule->mCompiler->mOptions.mEmitLineInfo))
 	{
 		// Emit a NOP so we always have a "step over" point

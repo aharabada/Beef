@@ -4936,8 +4936,40 @@ namespace IDE
 			CompileAndRun(true);
 		}
 
+		SourceEditWidgetContent GetStepIntoSpecificHiliteEwc()
+		{
+			var sourceViewPanel = GetActiveSourceViewPanel();
+			if (sourceViewPanel == null)
+				return null;
+			var ewc = sourceViewPanel.mEditWidget.mEditWidgetContent as SourceEditWidgetContent;
+			if ((ewc != null) && (ewc.mStepIntoSpecificHilite != null))
+				return ewc;
+			return null;
+		}
+
 		[IDECommand]
 		void StepInto()
+		{
+			var hiliteEwc = GetStepIntoSpecificHiliteEwc();
+			if (hiliteEwc != null)
+			{
+				// The Step Into hotkey confirms the pending inline selection
+				hiliteEwc.mStepIntoSpecificHilite.Submit();
+				return;
+			}
+
+			if ((mSettings.mDebuggerSettings.mAlwaysStepIntoSpecific) &&
+				(mDebugger.mIsRunning) && (mExecutionPaused) && (mDebugger.IsPaused()) &&
+				(!IsInDisassemblyMode()))
+			{
+				StepIntoSpecific();
+				return;
+			}
+
+			DoStepInto();
+		}
+
+		void DoStepInto()
 		{
 			if (mDebugger.mIsRunning)
 			{
@@ -4951,6 +4983,74 @@ namespace IDE
 			{
 				RunWithStep();
 			}
+		}
+
+		[IDECommand]
+		void StepIntoSpecific()
+		{
+			var hiliteEwc = GetStepIntoSpecificHiliteEwc();
+			if (hiliteEwc != null)
+			{
+				// Pressing the hotkey again confirms the selection
+				hiliteEwc.mStepIntoSpecificHilite.Submit();
+				return;
+			}
+
+			if ((!mDebugger.mIsRunning) || (!mExecutionPaused) || (!mDebugger.IsPaused()) ||
+				(IsInDisassemblyMode()))
+			{
+				DoStepInto();
+				return;
+			}
+
+			List<DebugManager.LineCall> lineCalls = scope .();
+			defer ClearAndDeleteItems(lineCalls);
+			mDebugger.GetLineCallsOfActiveStackFrame(lineCalls);
+
+			List<DebugManager.LineCall> candidates = scope .();
+			// Only calls we haven't passed yet are valid candidates
+			int validCandidates = 0;
+			DebugManager.LineCall firstValidCandidate = null;
+			for (var call in lineCalls)
+			{
+				if ((!mSettings.mDebuggerSettings.mShowFilteredCalls) &&
+					((call.mIsFiltered) || (call.mIsDefaultFiltered)))
+					continue;
+				if (mSettings.mDebuggerSettings.mShowAlreadyExecutedCalls || !call.mIsPastAddr)
+				{
+					candidates.Add(call);
+
+					if (!call.mIsPastAddr)
+					{
+						validCandidates++;
+
+						firstValidCandidate ??= call;
+					}
+				}
+			}
+
+			if (candidates.IsEmpty || validCandidates == 0)
+			{
+				DoStepInto();
+				return;
+			}
+
+			if (validCandidates == 1)
+			{
+				StepIntoSpecific(firstValidCandidate.mAddr);
+				return;
+			}
+
+			ShowPCLocation(mDebugger.mActiveCallStackIdx, false, true);
+			var sourceViewPanel = GetActiveSourceViewPanel();
+			if (sourceViewPanel == null)
+			{
+				DoStepInto();
+				return;
+			}
+
+			var ewc = (SourceEditWidgetContent)sourceViewPanel.mEditWidget.mEditWidgetContent;
+			ewc.ShowStepIntoSpecificHilite(candidates);
 		}
 
 		[IDECommand]
@@ -6357,6 +6457,7 @@ namespace IDE
 			subMenu.AddMenuItem("&Profile", "Profile", new => UpdateMenuItem_HasWorkspace);
 			subMenu.AddMenuItem(null);
 			subMenu.AddMenuItem("Step Into", "Step Into", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
+			subMenu.AddMenuItem("Step into Specific", "Step into Specific", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
 			subMenu.AddMenuItem("Step Over", "Step Over", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
 			subMenu.AddMenuItem("Step Out", "Step Out", new => UpdateMenuItem_DebugPaused);
 			subMenu.AddMenuItem(null);

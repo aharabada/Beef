@@ -461,7 +461,7 @@ namespace Beefy.widgets
                 Close();
         }
 
-        void HandleKeyDown(KeyDownEvent evt)
+        protected virtual void HandleKeyDown(KeyDownEvent evt)
         {
             if (evt.mKeyCode == KeyCode.Escape)
             {

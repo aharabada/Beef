@@ -1151,6 +1151,86 @@ namespace IDE.Debugger
 			outCallAddresses.Append(strPtr);
 		}
 
+		public class LineCall
+		{
+			public int mAddr; // Address of the call instruction
+			public String mName ~ delete _; // null => unresolved indirect call
+			public bool mIsPastAddr;
+			public bool mIsDefaultFiltered;
+			public bool mIsFiltered;
+			public int32 mLine = -1; // 0-based source line of the call site (-1 = unknown)
+			public int32 mColumn = -1; // 0-based char index within the line (-1 = unknown)
+
+			public void GetDisplayName(String outStr)
+			{
+				if (mName != null)
+					outStr.Append(mName);
+				else
+					outStr.AppendF("Indirect call at 0x{0:X}", mAddr);
+			}
+		}
+
+		public bool GetLineCallsOfActiveStackFrame(List<LineCall> outCalls)
+		{
+			if (!IsPaused())
+				return false;
+
+			int addr;
+			String file = scope .();
+			String stackFrameInfo = scope .();
+			GetStackFrameInfo(mActiveCallStackIdx, out addr, file, stackFrameInfo);
+			if (addr == 0)
+				return false;
+
+			var checkAddr = addr;
+			if (mActiveCallStackIdx > 0)
+				checkAddr = GetStackFrameCalleeAddr(mActiveCallStackIdx);
+
+			String lineCallAddrs = scope .();
+			FindLineCallAddresses(checkAddr, lineCallAddrs);
+
+			for (var callStr in lineCallAddrs.Split('\n'))
+			{
+				if (callStr.IsEmpty)
+					continue;
+
+				var callData = callStr.Split('\t');
+
+				var call = new LineCall();
+				var addrStr = callData.GetNext().Value;
+				if (addrStr.StartsWith('-'))
+				{
+					call.mIsPastAddr = true;
+					addrStr = addrStr.Substring(1);
+				}
+				call.mAddr = (int)int64.Parse(addrStr, System.Globalization.NumberStyles.HexNumber);
+
+				if (callData.GetNext() case .Ok(let nameView))
+				{
+					if (!nameView.IsEmpty)
+						call.mName = new String(nameView);
+				}
+				if (callData.GetNext() case .Ok(let flagsView))
+				{
+					call.mIsDefaultFiltered = flagsView.Contains('d');
+					call.mIsFiltered = flagsView.Contains('f');
+				}
+				if (callData.GetNext() case .Ok(let posView))
+				{
+					int commaIdx = posView.IndexOf(',');
+					if (commaIdx > 0)
+					{
+						if (int32.Parse(posView.Substring(0, commaIdx)) case .Ok(let lineVal))
+							call.mLine = lineVal;
+						if (int32.Parse(posView.Substring(commaIdx + 1)) case .Ok(let columnVal))
+							call.mColumn = columnVal;
+					}
+				}
+				outCalls.Add(call);
+			}
+			return true;
+		}
+
 		public void DisassembleAt(int addr, String outText)
 		{
 			char8* strPtr = Debugger_DisassembleAt(addr);
