@@ -2870,8 +2870,27 @@ void BfModule::UpdateSrcPos(BfAstNode* astNode, BfSrcPosFlags flags, int debugLo
 
 void BfModule::UpdateExprSrcPos(BfAstNode* astNode, BfSrcPosFlags flags)
 {
-	// We've turned off expr src pos (for now?)
-	//UpdateSrcPos(astNode, (BfSrcPosFlags)(flags | BfSrcPosFlag_Expression));
+	if (((mBfIRBuilder->mIgnoreWrites)) && ((flags & BfSrcPosFlag_Force) == 0))
+		return;
+	if (astNode == NULL)
+		return;
+
+	// Only emit expression-level positions for same-line targets. This keeps the line table
+	//  line-stable so stepping and breakpoint binding are unaffected; only columns become
+	//  finer-grained (the debugger explicitly ignores same-line column changes when stepping).
+	auto parserData = astNode->GetSourceData()->ToParserData();
+	if (parserData == NULL)
+		return;
+	if ((mCurFilePosition.mFileInstance == NULL) || (mCurFilePosition.mFileInstance->mParser != parserData))
+		return;
+
+	int line = 0;
+	int lineChar = 0;
+	parserData->GetLineCharAtIdx(astNode->GetSrcStart(), line, lineChar);
+	if (line != mCurFilePosition.mCurLine)
+		return;
+
+	UpdateSrcPos(astNode, (BfSrcPosFlags)(flags | BfSrcPosFlag_Expression));
 }
 
 void BfModule::UseDefaultSrcPos(BfSrcPosFlags flags, int debugLocOffset)

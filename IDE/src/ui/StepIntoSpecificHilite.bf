@@ -15,7 +15,6 @@ namespace IDE.ui
 		{
 			public int32 mTextIdx; // Absolute index into mData.mText
 			public int32 mLength;
-			public int32 mEntryIdx; // Execution-order entry; badge text = mEntryIdx + 1
 		}
 
 		public struct Entry // One per debugger candidate, in execution order
@@ -23,9 +22,9 @@ namespace IDE.ui
 			public int mCallAddr;
 			public bool mIsPast;
 			public bool mIsFiltered; // Drives the .StepFilter icon on menu rows
-			public String mMenuLabel; // Owned; only set for menu-row entries, else null
-			public int32 mSpanIdx; // Index into mSpans, or -1 => lives in the dropdown
-			public int32 mMenuRowIdx; // Row in the passive menu, or -1 => inline span
+			public String mMenuLabel; // Owned; "N  DisplayName"
+			public int32 mSpanIdx; // Index into mSpans (any number of entries may share one span), or -1 => list row only
+			// The list shows every entry, so the menu row index == the entry index
 		}
 
 		enum TokenKind
@@ -42,6 +41,7 @@ namespace IDE.ui
 			public StringView mText;
 			public TokenKind mKind;
 			public bool mClaimed;
+			public int32 mSpanIdx; // Span created for this token during matching (pre-sort index), or -1
 		}
 
 		enum MatchKey
@@ -127,9 +127,9 @@ namespace IDE.ui
 			return ((c >= 'A') && (c <= 'Z')) || ((c >= 'a') && (c <= 'z')) || ((c >= '0') && (c <= '9')) || (c == '_') || (c == '@');
 		}
 
-		static void CollectTokens(SourceEditWidgetContent ewc, int line, String lineText, List<Token> tokens)
+		static void CollectTokens(SourceEditWidgetContent ewc, int line, String lineText, List<Token> tokens, out int lineStart)
 		{
-			ewc.GetLinePosition(line, var lineStart, var lineEnd);
+			ewc.GetLinePosition(line, out lineStart, let lineEnd);
 			for (int i = lineStart; i < lineEnd; i++)
 				lineText.Append(ewc.mData.mText[i].mChar);
 
@@ -146,7 +146,7 @@ namespace IDE.ui
 					wantIdent = IsIdentChar(c);
 					kind = wantIdent ? .Identifier : .Operator;
 				}
-				else if (((elemType == .Type) || (elemType == .Struct) || (elemType == .Interface) || (elemType == .RefType)) && (IsIdentChar(c)))
+				else if (((elemType == .Type) || (elemType == .Struct) || (elemType == .Interface) || (elemType == .RefType) || (elemType == .Keyword)) && (IsIdentChar(c)))
 				{
 					wantIdent = true;
 					kind = .TypeName;
@@ -169,6 +169,7 @@ namespace IDE.ui
 				token.mText = .(lineText, i - lineStart, j - i);
 				token.mKind = kind;
 				token.mClaimed = false;
+				token.mSpanIdx = -1;
 				tokens.Add(token);
 				i = j;
 			}
@@ -255,11 +256,11 @@ namespace IDE.ui
 
 			String lineText = scope .();
 			List<Token> tokens = scope .();
-			CollectTokens(ewc, line, lineText, tokens);
+			CollectTokens(ewc, line, lineText, tokens, var lineStart);
 
 			List<Span> spans = scope .();
 			List<Entry> entries = scope .();
-			
+
 			for (var call in calls)
 			{
 				Entry entry;
@@ -268,58 +269,118 @@ namespace IDE.ui
 				entry.mIsFiltered = (call.mIsFiltered) || (call.mIsDefaultFiltered);
 				entry.mMenuLabel = null;
 				entry.mSpanIdx = -1;
-				entry.mMenuRowIdx = -1;
+				entries.Add(entry);
+			}
 
+			List<int32> heuristicEntries = scope .();
+
+			// Pass A: exact positions from the debug info (expression-level source positions).
+			// For named candidates the column is a disambiguator, never sole authority: the
+			// name-compatibility check protects against coarse statement columns from older
+			// debug info or LLVM builds. Nameless (indirect) candidates only carry a column
+			// when it came from our own same-line emission, so they bind without a check.
+			for (int entryIdx < entries.Count)
+			{
+				var call = calls[entryIdx];
 				bool matched = false;
-				if (call.mName != null)
+				if ((call.mColumn >= 0) && (call.mLine == line))
 				{
-					var key = DeriveMatchKey(call.mName);
-					if (!(key case .Unmatchable))
+					MatchKey key = .Unmatchable;
+					bool keyValid = false;
+					if (call.mName != null)
 					{
-						for (int pass < 2)
-						{
-							// Greedy: execution-order candidates claim the leftmost unclaimed token.
-							// Nested same-name calls (`Foo(Foo(x))`) therefore pair the outer token with
-							// the inner call - both target the same method, so this is acceptable.
-							for (int tokenIdx < tokens.Count)
-							{
-								var token = ref tokens[tokenIdx];
-								if (token.mClaimed)
-									continue;
-								if (!TokenMatches(token, key, pass))
-									continue;
+						key = DeriveMatchKey(call.mName);
+						keyValid = !(key case .Unmatchable);
+					}
 
+					if ((call.mName == null) || (keyValid))
+					{
+						int wantIdx = lineStart + call.mColumn;
+						for (int tokenIdx < tokens.Count)
+						{
+							var token = ref tokens[tokenIdx];
+							if ((wantIdx < token.mTextIdx) || (wantIdx >= token.mTextIdx + token.mLength))
+								continue;
+
+							if (keyValid)
+							{
+								bool compat = false;
+								for (int pass < 2)
+								{
+									if (TokenMatches(token, key, pass))
+									{
+										compat = true;
+										break;
+									}
+								}
+								if (!compat)
+									break; // Wrong token under this column - leave for the heuristic pass
+							}
+
+							if (!token.mClaimed)
+							{
 								token.mClaimed = true;
 								Span span;
 								span.mTextIdx = token.mTextIdx;
 								span.mLength = token.mLength;
-								span.mEntryIdx = (int32)entries.Count;
+								token.mSpanIdx = (int32)spans.Count;
 								spans.Add(span);
-								matched = true;
-								break;
 							}
-							if (matched)
-								break;
+							// Any number of candidates may share one token (e.g. property get/set
+							// pairs, or the delete keyword's destructor call)
+							entries[entryIdx].mSpanIdx = token.mSpanIdx;
+							matched = true;
+							break;
 						}
 					}
 				}
-
-				entries.Add(entry);
+				if (!matched)
+					heuristicEntries.Add((int32)entryIdx);
 			}
 
-			spans.Sort(scope (lhs, rhs) => lhs.mTextIdx <=> rhs.mTextIdx);
-			for (int32 spanIdx < (int32)spans.Count)
-				entries[spans[spanIdx].mEntryIdx].mSpanIdx = spanIdx;
+			// Pass B: greedy name matching for candidates without an exact position, claiming the
+			// leftmost unclaimed token. Nested same-name calls (`Foo(Foo(x))`) pair the outer token
+			// with the inner call here - both target the same method, so this is acceptable.
+			for (var entryIdx in heuristicEntries)
+			{
+				var call = calls[entryIdx];
+				if (call.mName == null)
+					continue;
+				var key = DeriveMatchKey(call.mName);
+				if (key case .Unmatchable)
+					continue;
 
-			// Unmatched candidates become dropdown rows; build their labels as owned strings
-			// while the LineCalls are still alive
-			int32 menuRowIdx = 0;
+				bool matched = false;
+				for (int pass < 2)
+				{
+					for (int tokenIdx < tokens.Count)
+					{
+						var token = ref tokens[tokenIdx];
+						if (token.mClaimed)
+							continue;
+						if (!TokenMatches(token, key, pass))
+							continue;
+
+						token.mClaimed = true;
+						Span span;
+						span.mTextIdx = token.mTextIdx;
+						span.mLength = token.mLength;
+						token.mSpanIdx = (int32)spans.Count;
+						spans.Add(span);
+						entries[entryIdx].mSpanIdx = token.mSpanIdx;
+						matched = true;
+						break;
+					}
+					if (matched)
+						break;
+				}
+			}
+
+			// Every entry gets a list row - build the labels as owned strings while the
+			// LineCalls are still alive
 			for (int entryIdx < entries.Count)
 			{
 				var entry = ref entries[entryIdx];
-				if (entry.mSpanIdx != -1)
-					continue;
-				entry.mMenuRowIdx = menuRowIdx++;
 				entry.mMenuLabel = new String();
 				entry.mMenuLabel.AppendF("{0}  ", entryIdx + 1);
 				calls[entryIdx].GetDisplayName(entry.mMenuLabel);
@@ -333,41 +394,36 @@ namespace IDE.ui
 			hilite.mTextVersionId = ewc.mData.mCurTextVersionId;
 			hilite.mCallStackIdx = gApp.mDebugger.mActiveCallStackIdx;
 
-			// The first non-past entry is the next call to execute - it becomes the initial
-			// selection (which may be a dropdown row)
+			// Prefer the first non-past, non-filtered entry as the initial selection (the next
+			// call one actually wants to step into); fall back to the first non-past one
+			int32 selIdx = -1;
 			for (int entryIdx < entries.Count)
 			{
-				if (!entries[entryIdx].mIsPast)
+				let entry = entries[entryIdx];
+				if (entry.mIsPast)
+					continue;
+				if (!entry.mIsFiltered)
 				{
-					hilite.mSelIdx = (int32)entryIdx;
+					selIdx = (int32)entryIdx;
 					break;
 				}
+				if (selIdx == -1)
+					selIdx = (int32)entryIdx;
 			}
+			hilite.mSelIdx = selIdx;
 			return hilite;
 		}
 
 		// Called by the edit widget content AFTER the hilite has been assigned to its field, so
-		// the menu-closed path (CancelStepIntoSpecificHilite) operates on a live field
-		public void ShowMenuIfNeeded(float x, float y)
+		// the menu-closed path (CancelStepIntoSpecificHilite) operates on a live field.
+		// The list always shows ALL candidates (numbered, full names) - spans and list rows are
+		// two views of the same selection.
+		public void ShowMenu(float x, float y)
 		{
-			bool hasMenuRows = false;
-			for (var entry in ref mEntries)
-			{
-				if (entry.mMenuRowIdx != -1)
-				{
-					hasMenuRows = true;
-					break;
-				}
-			}
-			if (!hasMenuRows)
-				return; // Pure inline - numbers only
-
 			Menu menu = new Menu();
 			for (int entryIdx < mEntries.Count)
 			{
 				var entry = ref mEntries[entryIdx];
-				if (entry.mMenuRowIdx == -1)
-					continue;
 				var item = menu.AddItem(entry.mMenuLabel);
 				if (entry.mIsFiltered)
 					item.mIconImage = DarkTheme.sDarkTheme.GetImage(.StepFilter);
@@ -413,30 +469,21 @@ namespace IDE.ui
 
 		void OnMenuSelectionChanged(int selIdx)
 		{
-			if ((mIgnoreMenuSelChange) || (selIdx < 0))
+			// Menu row index == entry index (every entry has a row)
+			if ((mIgnoreMenuSelChange) || (selIdx < 0) || (selIdx >= mEntries.Count))
 				return;
-			for (int entryIdx < mEntries.Count)
-			{
-				let entry = mEntries[entryIdx];
-				if ((entry.mMenuRowIdx == selIdx) && (!entry.mIsPast))
-				{
-					mSelIdx = (int32)entryIdx;
-					break;
-				}
-			}
+			if (!mEntries[selIdx].mIsPast)
+				mSelIdx = (int32)selIdx;
 		}
 
 		void SyncMenuSelection()
 		{
 			if (mMenuWidget == null)
 				return;
-			int32 wantRow = -1;
-			if ((mSelIdx >= 0) && (mSelIdx < mEntries.Count))
-				wantRow = mEntries[mSelIdx].mMenuRowIdx;
-			if (mMenuWidget.mSelectIdx != wantRow)
+			if (mMenuWidget.mSelectIdx != mSelIdx)
 			{
 				mIgnoreMenuSelChange = true;
-				mMenuWidget.SetSelection(wantRow);
+				mMenuWidget.SetSelection(mSelIdx);
 				mIgnoreMenuSelChange = false;
 			}
 		}
@@ -491,8 +538,23 @@ namespace IDE.ui
 			for (int spanIdx < mSpans.Count)
 			{
 				let span = mSpans[spanIdx];
-				let entry = mEntries[span.mEntryIdx];
-				bool isSelected = (span.mEntryIdx == mSelIdx) && (!entry.mIsPast);
+
+				// A span dims only when ALL of its calls are done and shows the selection
+				// outline when ANY of its entries is selected
+				bool allPast = true;
+				bool isSelected = false;
+				for (int entryIdx < mEntries.Count)
+				{
+					let entry = mEntries[entryIdx];
+					if (entry.mSpanIdx != spanIdx)
+						continue;
+					if (!entry.mIsPast)
+					{
+						allPast = false;
+						if (entryIdx == mSelIdx)
+							isSelected = true;
+					}
+				}
 
 				ewc.GetLineCharAtIdx(span.mTextIdx, let line, let lineChar);
 				if (ewc.GetLineHeight(line) <= 0.1f)
@@ -501,7 +563,7 @@ namespace IDE.ui
 				ewc.GetTextCoordAtLineChar(line, lineChar + span.mLength, let endX, let endY);
 				float width = endX - x;
 
-				if (entry.mIsPast)
+				if (allPast)
 				{
 					using (g.PushColor(DarkTheme.COLOR_PAST_STEP_INTO_HILITE))
 						g.FillRect(x, y + offset, width, height);
@@ -534,46 +596,56 @@ namespace IDE.ui
 			for (int spanIdx < mSpans.Count)
 			{
 				let span = mSpans[spanIdx];
-				let entry = mEntries[span.mEntryIdx];
-				bool isSelected = (span.mEntryIdx == mSelIdx) && (!entry.mIsPast);
 
 				ewc.GetLineCharAtIdx(span.mTextIdx, let line, let lineChar);
 				if (ewc.GetLineHeight(line) <= 0.1f)
 					continue; // Collapsed
 				ewc.GetTextCoordAtLineChar(line, lineChar, let x, let y);
 
-				// Execution-order badge at the span's top-left, dipping into the line above
-				String numStr = scope $"{span.mEntryIdx + 1}";
-				float badgeWidth = badgeFont.GetWidth(numStr) + GS!(6);
+				// Execution-order badges at the span's top-left, dipping into the line above.
+				// A span shared by several calls (property get/set pairs, delete machinery)
+				// shows all their badges side by side.
 				float badgeX = x;
 				float badgeY = y + offset - badgeHeight;
 
-				// Check if the badge would be clipped at the top
+				// Check if the badges would be clipped at the top
 				Vector2 translated = g.mMatrix.Multiply(Vector2(badgeX, badgeY));
 				if (translated.mY < g.mClipRect?.Top)
 					badgeY = y + lineHeight;
 
-				uint32 bgColor;
-				uint32 textColor;
-				if (entry.mIsPast)
+				for (int entryIdx < mEntries.Count)
 				{
-					bgColor = DarkTheme.COLOR_PAST_STEP_INTO_HILITE;
-					textColor = DarkTheme.COLOR_TEXT_DISABLED;
+					let entry = mEntries[entryIdx];
+					if (entry.mSpanIdx != spanIdx)
+						continue;
+					bool isSelected = (entryIdx == mSelIdx) && (!entry.mIsPast);
+
+					String numStr = scope $"{entryIdx + 1}";
+					float badgeWidth = badgeFont.GetWidth(numStr) + GS!(6);
+
+					uint32 bgColor;
+					uint32 textColor;
+					if (entry.mIsPast)
+					{
+						bgColor = DarkTheme.COLOR_PAST_STEP_INTO_HILITE;
+						textColor = DarkTheme.COLOR_TEXT_DISABLED;
+					}
+					else if (isSelected)
+					{
+						bgColor = DarkTheme.COLOR_STEP_INTO_OUTLINE;
+						textColor = DarkTheme.COLOR_TEXT;
+					}
+					else
+					{
+						bgColor = DarkTheme.COLOR_STEP_INTO_HILITE;
+						textColor = DarkTheme.COLOR_TEXT;
+					}
+					using (g.PushColor(bgColor))
+						g.FillRect(badgeX, badgeY, badgeWidth, badgeHeight);
+					using (g.PushColor(textColor))
+						g.DrawString(numStr, badgeX, badgeY, .Centered, badgeWidth);
+					badgeX += badgeWidth + GS!(1);
 				}
-				else if (isSelected)
-				{
-					bgColor = DarkTheme.COLOR_STEP_INTO_OUTLINE;
-					textColor = DarkTheme.COLOR_TEXT;
-				}
-				else
-				{
-					bgColor = DarkTheme.COLOR_STEP_INTO_HILITE;
-					textColor = DarkTheme.COLOR_TEXT;
-				}
-				using (g.PushColor(bgColor))
-					g.FillRect(badgeX, badgeY, badgeWidth, badgeHeight);
-				using (g.PushColor(textColor))
-					g.DrawString(numStr, badgeX, badgeY, .Centered, badgeWidth);
 			}
 
 			g.SetFont(ewc.mFont);

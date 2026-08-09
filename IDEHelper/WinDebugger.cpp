@@ -12808,6 +12808,17 @@ String WinDebugger::FindLineCallAddresses(intptr inAddress)
 
 		auto _HandleSection = [&]()
 		{
+			// With expression-level source positions each call instruction sits inside a line
+			//  entry whose column is the invocation target name token - pass it along so the
+			//  IDE can map calls to source tokens exactly
+			String posStr;
+			if ((checkSubprogram == dwSubprogram) && (checkLineData != NULL) &&
+				(dwSubprogram->GetLanguage() == DbgLanguage_Beef) &&
+				(checkLineData->mColumn >= 0) && (checkLineData->mLine == startLineData->mLine))
+			{
+				posStr = StrFormat("%d,%d", checkLineData->mLine, (int)checkLineData->mColumn);
+			}
+
 			while (addr < endAddr)
 			{
 				CPUInst inst;
@@ -12817,53 +12828,47 @@ String WinDebugger::FindLineCallAddresses(intptr inAddress)
 				*registers.GetPCRegisterRef() = addr;
 				if (inst.IsCall())
 				{
-					bool addSymbol = true;
-
-					if (addr < (addr_target)inAddress)
-						callAddresses += "-";
-					callAddresses += EncodeDataPtr(addr, false);
+					// Record format: [-]addr \t name \t attrs \t line,column
+					//  ('name', 'attrs' and the position may be empty)
+					bool addRecord = true;
+					String name;
+					String attrs;
 
 					addr_target targetAddr = inst.GetTarget(this, &registers);
 					if (targetAddr != 0)
 					{
-						String outSymbol;
 						auto subprogram = mDebugTarget->FindSubProgram(targetAddr);
 						if (subprogram != NULL)
 						{
-							CreateFilterName(outSymbol, subprogram);
-							addSymbol = true;
+							CreateFilterName(name, subprogram);
 						}
 						else
 						{
 							addr_target offset = 0;
-							String fullSymbolName;
-							if (mDebugTarget->FindSymbolAt(targetAddr, &outSymbol, &offset))
+							if (mDebugTarget->FindSymbolAt(targetAddr, &name, &offset))
 							{
 								if (offset < 0x200)
 								{
-									//outSymbol = BfDemangler::Demangle(outSymbol, dwSubprogram->GetLanguage());
-									if (outSymbol == "___chkstk_ms")
-										addSymbol = false;
+									//name = BfDemangler::Demangle(name, dwSubprogram->GetLanguage());
+									if (name == "___chkstk_ms")
+										addRecord = false;
 									else
 									{
-										String demangledName = BfDemangler::Demangle(outSymbol, DbgLanguage_C);
-										outSymbol.clear();
-										CreateFilterName(outSymbol, demangledName.c_str(), DbgLanguage_C);
+										String demangledName = BfDemangler::Demangle(name, DbgLanguage_C);
+										name.clear();
+										CreateFilterName(name, demangledName.c_str(), DbgLanguage_C);
 									}
 								}
 								else
-									outSymbol.clear();
+									name.clear();
 							}
 						}
 
-						if (addSymbol)
-						{
-							if (outSymbol.empty())
-								callAddresses += "\tFunc@" + EncodeDataPtr(targetAddr, false);
-							else
-								callAddresses += "\t" + outSymbol;
+						if ((addRecord) && (name.empty()))
+							name = "Func@" + EncodeDataPtr(targetAddr, false);
 
-							String attrs;
+						if (addRecord)
+						{
 							bool isFiltered = false;
 							if (subprogram != NULL)
 							{
@@ -12874,19 +12879,21 @@ String WinDebugger::FindLineCallAddresses(intptr inAddress)
 							}
 
 							StepFilter* stepFilterPtr = NULL;
-							if (mDebugManager->mStepFilters.TryGetValue(outSymbol, &stepFilterPtr))
+							if (mDebugManager->mStepFilters.TryGetValue(name, &stepFilterPtr))
 								isFiltered = stepFilterPtr->IsFiltered(isFiltered);
 
 							if (isFiltered)
 								attrs += "f";  // 'f' for filter
-
-							if (!attrs.IsEmpty())
-								callAddresses += "\t" + attrs;
 						}
 					}
 
-					if (addSymbol)
-						callAddresses += "\n";
+					if (addRecord)
+					{
+						if (addr < (addr_target)inAddress)
+							callAddresses += "-";
+						callAddresses += EncodeDataPtr(addr, false);
+						callAddresses += "\t" + name + "\t" + attrs + "\t" + posStr + "\n";
+					}
 				}
 
 				inst.PartialSimulate(this, &registers);
@@ -12911,22 +12918,27 @@ String WinDebugger::FindLineCallAddresses(intptr inAddress)
 				auto checkLineData = dwSubprogram->FindClosestLine(inlineStartAddr, &callingSubprogram);
 				if ((checkLineData != NULL) && (checkLineData->mCtxIdx == startLineData->mCtxIdx) && (checkLineData->mLine == startLineData->mLine))
 				{
+					// The caller-context entry carries the call-site name token column
+					String posStr;
+					if ((dwSubprogram->GetLanguage() == DbgLanguage_Beef) && (checkLineData->mColumn >= 0))
+						posStr = StrFormat("%d,%d", checkLineData->mLine, (int)checkLineData->mColumn);
+
 					if (inlineStartAddr <= (addr_target)inAddress)
 						callAddresses += "-";
 					callAddresses += EncodeDataPtr(inlineStartAddr, false);
 					String outSymbol;
 					CreateFilterName(outSymbol, checkSubprogram);
-					callAddresses += "\t" + outSymbol;
 
+					String attrs;
 					bool isFiltered = dwSubprogram->mIsStepFilteredDefault;
 					StepFilter* stepFilterPtr;
 					if (mDebugManager->mStepFilters.TryGetValue(outSymbol, &stepFilterPtr))
 						isFiltered = stepFilterPtr->IsFiltered(isFiltered);
 
 					if (isFiltered)
-						callAddresses += "\tf"; // 'f' for filter
+						attrs += "f"; // 'f' for filter
 
-					callAddresses += "\n";
+					callAddresses += "\t" + outSymbol + "\t" + attrs + "\t" + posStr + "\n";
 				}
 
 // 				if (checkSubprogram->mBlock.mHighPC < endAddr)

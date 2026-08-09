@@ -335,6 +335,7 @@ namespace IDE.ui
 			AddPropertiesItem(root, "Auto Refresh Side Effects", "mAutoRefreshWatches");
 			AddPropertiesItem(root, "Always do Step into Specific", "mAlwaysStepIntoSpecific");
 			AddPropertiesItem(root, "Show already executed calls in 'Step into Specific'", "mShowAlreadyExecutedCalls");
+			AddPropertiesItem(root, "Show filtered calls in 'Step into Specific'", "mShowFilteredCalls");
 		}
 
 		protected override void ResetSettings()

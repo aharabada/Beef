@@ -165,6 +165,7 @@ namespace IDE
 			public bool mAutoRefreshWatches = false;
 			public bool mAlwaysStepIntoSpecific = false;
 			public bool mShowAlreadyExecutedCalls = false;
+			public bool mShowFilteredCalls = true;
 
 			public void Serialize(StructuredData sd)
 			{
@@ -210,6 +211,7 @@ namespace IDE
 				sd.Add("AutoRefreshWatches", mAutoRefreshWatches);
 				sd.Add("AlwaysStepIntoSpecific", mAlwaysStepIntoSpecific);
 				sd.Add("ShowAlreadyExecutedCalls", mShowAlreadyExecutedCalls);
+				sd.Add("ShowFilteredCalls", mShowFilteredCalls);
 			}
 
 			public void Deserialize(StructuredData sd)
@@ -253,6 +255,7 @@ namespace IDE
 				sd.Get("AutoRefreshWatches", ref mAutoRefreshWatches);
 				sd.Get("AlwaysStepIntoSpecific", ref mAlwaysStepIntoSpecific);
 				sd.Get("ShowAlreadyExecutedCalls", ref mShowAlreadyExecutedCalls);
+				sd.Get("ShowFilteredCalls", ref mShowFilteredCalls);
 			}
 
 			public void Apply()

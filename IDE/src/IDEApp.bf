@@ -5001,6 +5001,9 @@ namespace IDE
 			DebugManager.LineCall firstValidCandidate = null;
 			for (var call in lineCalls)
 			{
+				if ((!mSettings.mDebuggerSettings.mShowFilteredCalls) &&
+					((call.mIsFiltered) || (call.mIsDefaultFiltered)))
+					continue;
 				if (mSettings.mDebuggerSettings.mShowAlreadyExecutedCalls || !call.mIsPastAddr)
 				{
 					candidates.Add(call);

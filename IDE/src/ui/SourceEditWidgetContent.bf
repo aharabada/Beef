@@ -4644,7 +4644,7 @@ namespace IDE.ui
 			ClampMenuCoords(ref menuX, ref menuY);
 
 			mStepIntoSpecificHilite = StepIntoSpecificHilite.Create(this, calls);
-			mStepIntoSpecificHilite.ShowMenuIfNeeded(menuX, menuY);
+			mStepIntoSpecificHilite.ShowMenu(menuX, menuY);
 		}
 
 		public override void HandleKey(KeyCode keyCode, KeyFlags keyFlags, bool isRepeat)

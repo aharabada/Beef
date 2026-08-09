@@ -1157,6 +1157,8 @@ namespace IDE.Debugger
 			public bool mIsPastAddr;
 			public bool mIsDefaultFiltered;
 			public bool mIsFiltered;
+			public int32 mLine = -1; // 0-based source line of the call site (-1 = unknown)
+			public int32 mColumn = -1; // 0-based char index within the line (-1 = unknown)
 
 			public void GetDisplayName(String outStr)
 			{
@@ -1203,11 +1205,25 @@ namespace IDE.Debugger
 				call.mAddr = (int)int64.Parse(addrStr, System.Globalization.NumberStyles.HexNumber);
 
 				if (callData.GetNext() case .Ok(let nameView))
-					call.mName = new String(nameView);
+				{
+					if (!nameView.IsEmpty)
+						call.mName = new String(nameView);
+				}
 				if (callData.GetNext() case .Ok(let flagsView))
 				{
 					call.mIsDefaultFiltered = flagsView.Contains('d');
 					call.mIsFiltered = flagsView.Contains('f');
+				}
+				if (callData.GetNext() case .Ok(let posView))
+				{
+					int commaIdx = posView.IndexOf(',');
+					if (commaIdx > 0)
+					{
+						if (int32.Parse(posView.Substring(0, commaIdx)) case .Ok(let lineVal))
+							call.mLine = lineVal;
+						if (int32.Parse(posView.Substring(commaIdx + 1)) case .Ok(let columnVal))
+							call.mColumn = columnVal;
+					}
 				}
 				outCalls.Add(call);
 			}
