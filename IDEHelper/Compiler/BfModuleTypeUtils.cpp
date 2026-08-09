@@ -6056,7 +6056,7 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 		{
 			for (auto propDef : typeInstance->mTypeDef->mProperties)
 				if (propDef->mFieldDeclaration != NULL)
-					mCompiler->mResolvePassData->mAutoComplete->CheckProperty(BfNodeDynCast<BfPropertyDeclaration>(propDef->mFieldDeclaration));
+					mCompiler->mResolvePassData->mAutoComplete->CheckProperty(BfNodeDynCast<BfPropertyDeclaration>(propDef->mFieldDeclaration), typeInstance->mTypeDef);
 		}
 	}
 

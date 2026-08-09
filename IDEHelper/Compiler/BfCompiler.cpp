@@ -4883,7 +4883,7 @@ void BfCompiler::ProcessAutocompleteTempType()
 
 		auto propDeclaration = BfNodeDynCast<BfPropertyDeclaration>(fieldDecl);
 		if (propDeclaration != NULL)
-			autoComplete->CheckProperty(propDeclaration);
+			autoComplete->CheckProperty(propDeclaration, tempTypeDef);
 
 		if (BfNodeIsA<BfVarTypeReference>(propDef->mTypeRef))
 		{

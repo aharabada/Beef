@@ -264,7 +264,7 @@ public:
 	void CheckInvocation(BfAstNode* invocationNode, BfTokenNode* openParen, BfTokenNode* closeParen, const BfSizedArray<BfTokenNode*>& commas);
 	void CheckNode(BfAstNode* node, bool mayBeIdentifier, bool isInExpression = false);
 	void CheckMethod(BfMethodDeclaration* methodDeclaration, bool isLocalMethod);
-	void CheckProperty(BfPropertyDeclaration* propertyDeclaration);
+	void CheckProperty(BfPropertyDeclaration* propertyDeclaration, BfTypeDef* typeDef);
 	void CheckVarResolution(BfAstNode* varTypeRef, BfType* resolvedTypeRef);
 	void CheckResult(BfAstNode* node, const BfTypedValue& typedValue);
 	void CheckLocalDef(BfAstNode* identifierNode, BfLocalVariable* varDecl);
@@ -283,6 +283,9 @@ public:
 	void FixitCheckNamespace(BfTypeDef* activeTypeDef, BfAstNode* typeRef, BfTokenNode* nextDotToken);
 	void FixitAddConstructor(BfTypeInstance* typeInstance);
 	void FixitAddFullyQualify(BfAstNode* refNode, const StringImpl& findName, const SizedArrayImpl<BfUsingFieldData::MemberRef>& foundList);
+	void FixitCheckPropertyBody(BfPropertyDeclaration* propertyDeclaration, BfTypeDef* typeDef);
+	void FixitCheckMethodBody(BfMethodDeclaration* methodDeclaration);
+	bool FixitGetCollapseReplace(BfParserData* parser, int anchorEnd, int blockStart, int deleteEnd, const StringImpl& insertText, StringImpl& outOps);
 
 	void AddResultTypeKind(BfType* type);
 	void SetResultStringType(BfType* type);

@@ -2968,6 +2968,8 @@ void BfAutoComplete::UpdateReplaceData()
 
 void BfAutoComplete::CheckMethod(BfMethodDeclaration* methodDeclaration, bool isLocalMethod)
 {
+	FixitCheckMethodBody(methodDeclaration);
+
 	if (/*(propertyDeclaration->mDefinitionBlock == NULL) &&*/ (methodDeclaration->mVirtualSpecifier != NULL) &&
 		(methodDeclaration->mVirtualSpecifier->GetToken() == BfToken_Override))
 	{
@@ -3039,8 +3041,10 @@ void BfAutoComplete::CheckMethod(BfMethodDeclaration* methodDeclaration, bool is
 		CheckTypeRef(methodDeclaration->mReturnType, true, isLocalMethod);
 }
 
-void BfAutoComplete::CheckProperty(BfPropertyDeclaration* propertyDeclaration)
+void BfAutoComplete::CheckProperty(BfPropertyDeclaration* propertyDeclaration, BfTypeDef* typeDef)
 {
+	FixitCheckPropertyBody(propertyDeclaration, typeDef);
+
 	if (IsAutocompleteNode(propertyDeclaration->mNameNode))
 	{
 		mInsertStartIdx = propertyDeclaration->mNameNode->GetSrcStart();
@@ -3935,6 +3939,978 @@ String BfAutoComplete::FixitGetLocation(BfParserData* parser, int insertPos)
 	int lineChar = 0;
 	parser->GetLineCharAtIdx(insertPos, line, lineChar);
 	return StrFormat("%s|%d:%d", parser->mFileName.c_str(), line, lineChar);
+}
+
+static bool FixitIsWhitespaceSpan(BfParserData* parser, int checkStart, int checkEnd)
+{
+	for (int i = checkStart; i < checkEnd; i++)
+	{
+		if (!::isspace((uint8)parser->mSrc[i]))
+			return false;
+	}
+	return true;
+}
+
+// Extracts source text for embedding into a fixit payload. Returns false if the text contains
+//  characters that would corrupt the payload or be misread as InsertImplText control chars
+static bool FixitEncodeSourceText(BfParserData* parser, int srcStart, int srcEnd, StringImpl& out)
+{
+	while ((srcStart < srcEnd) && (::isspace((uint8)parser->mSrc[srcStart])))
+		srcStart++;
+	while ((srcEnd > srcStart) && (::isspace((uint8)parser->mSrc[srcEnd - 1])))
+		srcEnd--;
+	if (srcStart >= srcEnd)
+		return false;
+	for (int i = srcStart; i < srcEnd; i++)
+	{
+		char c = parser->mSrc[i];
+		if ((c == '|') || (c == '\t') || (c == '\r') || (c == '\f') || (c == '\a') || (c == '\b') || (c == '\x01'))
+			return false;
+	}
+	out.Append(parser->mSrc + srcStart, srcEnd - srcStart);
+	out.Replace('\n', '\r');
+	return true;
+}
+
+// Returns the end-of-line position after startIdx if the remainder of the line contains only
+//  whitespace and comments, otherwise -1. Block-opening inserts (\t \r \f) internally jump to the
+//  line end, so they must be placed there - after any trailing comment - to not scramble the line
+static int FixitGetLineEndAfter(BfParserData* parser, int startIdx)
+{
+	int i = startIdx;
+	while (i < parser->mSrcLength)
+	{
+		char c = parser->mSrc[i];
+		if ((c == '\n') || (c == '\r'))
+			return i;
+		if (c == '/')
+		{
+			if ((i + 1 < parser->mSrcLength) && (parser->mSrc[i + 1] == '/'))
+			{
+				while ((i < parser->mSrcLength) && (parser->mSrc[i] != '\n') && (parser->mSrc[i] != '\r'))
+					i++;
+				return i;
+			}
+			if ((i + 1 < parser->mSrcLength) && (parser->mSrc[i + 1] == '*'))
+			{
+				i += 2;
+				while (true)
+				{
+					if (i + 1 >= parser->mSrcLength)
+						return -1;
+					if ((parser->mSrc[i] == '\n') || (parser->mSrc[i] == '\r'))
+						return -1; // Multi-line block comment
+					if ((parser->mSrc[i] == '*') && (parser->mSrc[i + 1] == '/'))
+						break;
+					i++;
+				}
+				i += 2;
+				continue;
+			}
+			return -1;
+		}
+		if (!::isspace((uint8)c))
+			return -1;
+		i++;
+	}
+	return i;
+}
+
+// Comments live on the parser's side channel and are invisible as block children, so before
+//  deleting a block we verify that the gaps between its children are pure whitespace
+static bool FixitBlockHasNoExtraText(BfBlock* block, BfParserData* parser)
+{
+	int pos = block->mOpenBrace->GetSrcEnd();
+	int size = block->GetSize();
+	for (int i = 0; i < size; i++)
+	{
+		BfAstNode* child = (*block)[i];
+		if (!FixitIsWhitespaceSpan(parser, pos, child->GetSrcStart()))
+			return false;
+		pos = child->GetSrcEnd();
+	}
+	return FixitIsWhitespaceSpan(parser, pos, block->mCloseBrace->GetSrcStart());
+}
+
+// Matches a block containing exactly `return <expr>;`. When the cursor isn't inside the block
+//  the reducer leaves it unreduced, so we handle both the reduced and the raw token form
+static bool FixitGetBlockReturnExpr(BfBlock* block, BfParserData* parser, int* exprStart, int* exprEnd)
+{
+	if ((block == NULL) || (block->mOpenBrace == NULL) || (block->mCloseBrace == NULL))
+		return false;
+	int size = block->GetSize();
+	if (size == 0)
+		return false;
+
+	if (auto retStmt = BfNodeDynCast<BfReturnStatement>((*block)[0]))
+	{
+		if ((size != 1) || (retStmt->mExpression == NULL) || (retStmt->mReturnToken == NULL))
+			return false;
+		if (!FixitIsWhitespaceSpan(parser, retStmt->mReturnToken->GetSrcEnd(), retStmt->mExpression->GetSrcStart()))
+			return false;
+		if ((retStmt->mTrailingSemicolon != NULL) &&
+			(!FixitIsWhitespaceSpan(parser, retStmt->mExpression->GetSrcEnd(), retStmt->mTrailingSemicolon->GetSrcStart())))
+			return false;
+		if (!FixitBlockHasNoExtraText(block, parser))
+			return false;
+		*exprStart = retStmt->mExpression->GetSrcStart();
+		*exprEnd = retStmt->mExpression->GetSrcEnd();
+		return true;
+	}
+
+	// Unreduced form: [return][<expr nodes>...][;]
+	if (size < 3)
+		return false;
+	auto firstToken = BfNodeDynCast<BfTokenNode>((*block)[0]);
+	auto lastToken = BfNodeDynCast<BfTokenNode>((*block)[size - 1]);
+	if ((firstToken == NULL) || (firstToken->mToken != BfToken_Return))
+		return false;
+	if ((lastToken == NULL) || (lastToken->mToken != BfToken_Semicolon))
+		return false;
+	for (int i = 1; i < size - 1; i++)
+	{
+		BfAstNode* child = (*block)[i];
+		if (auto tokenNode = BfNodeDynCast<BfTokenNode>(child))
+		{
+			if (tokenNode->mToken == BfToken_Semicolon)
+				return false;
+		}
+		if (child->IsA<BfBlock>())
+			return false;
+	}
+	if (!FixitBlockHasNoExtraText(block, parser))
+		return false;
+	*exprStart = (*block)[1]->GetSrcStart();
+	*exprEnd = (*block)[size - 2]->GetSrcEnd();
+	return true;
+}
+
+// Matches a block containing exactly one `<expr>;` statement (for void methods). Only handles
+//  the reduced form - when the block is unreduced we can't safely tell expressions from declarations
+static bool FixitGetBlockExprStmt(BfBlock* block, BfParserData* parser, int* exprStart, int* exprEnd)
+{
+	if ((block == NULL) || (block->mOpenBrace == NULL) || (block->mCloseBrace == NULL))
+		return false;
+	if (block->GetSize() != 1)
+		return false;
+	auto exprStmt = BfNodeDynCast<BfExpressionStatement>((*block)[0]);
+	if ((exprStmt == NULL) || (exprStmt->mExpression == NULL))
+		return false;
+	if ((exprStmt->mExpression->IsA<BfBlock>()) || (exprStmt->mExpression->IsA<BfVariableDeclaration>()))
+		return false;
+	if ((exprStmt->mTrailingSemicolon != NULL) &&
+		(!FixitIsWhitespaceSpan(parser, exprStmt->mExpression->GetSrcEnd(), exprStmt->mTrailingSemicolon->GetSrcStart())))
+		return false;
+	if (!FixitBlockHasNoExtraText(block, parser))
+		return false;
+	*exprStart = exprStmt->mExpression->GetSrcStart();
+	*exprEnd = exprStmt->mExpression->GetSrcEnd();
+	return true;
+}
+
+// Like FixitGetBlockExprStmt, but additionally handles the raw token form with conservative
+//  heuristics: anything that looks like a declaration or a non-expression statement is rejected
+static bool FixitGetBlockSingleExprStmt(BfBlock* block, BfParserData* parser, int* exprStart, int* exprEnd)
+{
+	if (FixitGetBlockExprStmt(block, parser, exprStart, exprEnd))
+		return true;
+
+	if ((block == NULL) || (block->mOpenBrace == NULL) || (block->mCloseBrace == NULL))
+		return false;
+	int size = block->GetSize();
+
+	// An assignment may sit in the block as a bare expression child
+	if (size == 1)
+	{
+		if (auto assignExpr = BfNodeDynCast<BfAssignmentExpression>((*block)[0]))
+		{
+			if (!FixitBlockHasNoExtraText(block, parser))
+				return false;
+			*exprStart = assignExpr->GetSrcStart();
+			*exprEnd = assignExpr->GetSrcEnd();
+			return true;
+		}
+	}
+	if (size < 2)
+		return false;
+
+	// Unreduced form: [<expr nodes>...][;]
+	auto lastToken = BfNodeDynCast<BfTokenNode>((*block)[size - 1]);
+	if ((lastToken == NULL) || (lastToken->mToken != BfToken_Semicolon))
+		return false;
+	if (auto firstToken = BfNodeDynCast<BfTokenNode>((*block)[0]))
+	{
+		// Statement keywords and declaration starters can't become an expression body
+		switch (firstToken->mToken)
+		{
+		case BfToken_Return:
+		case BfToken_Let:
+		case BfToken_Var:
+		case BfToken_Const:
+		case BfToken_If:
+		case BfToken_For:
+		case BfToken_While:
+		case BfToken_Do:
+		case BfToken_Switch:
+		case BfToken_Defer:
+		case BfToken_Break:
+		case BfToken_Continue:
+		case BfToken_Using:
+		case BfToken_Delete:
+			return false;
+		default:
+			break;
+		}
+	}
+	bool prevWasIdentifier = false;
+	for (int i = 0; i < size - 1; i++)
+	{
+		BfAstNode* child = (*block)[i];
+		if (auto tokenNode = BfNodeDynCast<BfTokenNode>(child))
+		{
+			if (tokenNode->mToken == BfToken_Semicolon)
+				return false;
+		}
+		if (child->IsA<BfBlock>())
+			return false;
+		// Two adjacent identifiers look like a declaration (`SomeType name = ...;`)
+		bool isIdentifier = BfNodeDynCastExact<BfIdentifierNode>(child) != NULL;
+		if ((isIdentifier) && (prevWasIdentifier))
+			return false;
+		prevWasIdentifier = isIdentifier;
+	}
+	if (!FixitBlockHasNoExtraText(block, parser))
+		return false;
+	*exprStart = (*block)[0]->GetSrcStart();
+	*exprEnd = (*block)[size - 2]->GetSrcEnd();
+	return true;
+}
+
+// Matches `get => <expr>;` or `get { return <expr>; }` (reduced or raw)
+static bool FixitGetAccessorReturnExpr(BfPropertyMethodDeclaration* accessor, BfParserData* parser, int* exprStart, int* exprEnd)
+{
+	if ((accessor == NULL) || (accessor->mNameNode == NULL))
+		return false;
+
+	int pos = accessor->mNameNode->GetSrcEnd();
+	if ((accessor->mMutSpecifier != NULL) && (accessor->mMutSpecifier->GetSrcStart() >= pos))
+	{
+		if (!FixitIsWhitespaceSpan(parser, pos, accessor->mMutSpecifier->GetSrcStart()))
+			return false;
+		pos = accessor->mMutSpecifier->GetSrcEnd();
+	}
+
+	if (accessor->mFatArrowToken != NULL)
+	{
+		if (accessor->mBody == NULL)
+			return false;
+		if (!FixitIsWhitespaceSpan(parser, pos, accessor->mFatArrowToken->GetSrcStart()))
+			return false;
+		if (!FixitIsWhitespaceSpan(parser, accessor->mFatArrowToken->GetSrcEnd(), accessor->mBody->GetSrcStart()))
+			return false;
+		if ((accessor->mEndSemicolon != NULL) &&
+			(!FixitIsWhitespaceSpan(parser, accessor->mBody->GetSrcEnd(), accessor->mEndSemicolon->GetSrcStart())))
+			return false;
+		*exprStart = accessor->mBody->GetSrcStart();
+		*exprEnd = accessor->mBody->GetSrcEnd();
+		return true;
+	}
+
+	auto block = BfNodeDynCast<BfBlock>(accessor->mBody);
+	if ((block == NULL) || (block->mOpenBrace == NULL) || (block->mCloseBrace == NULL))
+		return false;
+	if (!FixitIsWhitespaceSpan(parser, pos, block->GetSrcStart()))
+		return false;
+	return FixitGetBlockReturnExpr(block, parser, exprStart, exprEnd);
+}
+
+static bool FixitIsMatchingAssign(BfAssignmentExpression* assignExpr, BfParserData* parser, const StringImpl& fieldName)
+{
+	if (assignExpr->mOp != BfAssignmentOp_Assign)
+		return false;
+	auto lhs = BfNodeDynCastExact<BfIdentifierNode>(assignExpr->mLeft);
+	auto rhs = BfNodeDynCastExact<BfIdentifierNode>(assignExpr->mRight);
+	if ((lhs == NULL) || (rhs == NULL) || (assignExpr->mOpToken == NULL))
+		return false;
+	if (!FixitIsWhitespaceSpan(parser, lhs->GetSrcEnd(), assignExpr->mOpToken->GetSrcStart()))
+		return false;
+	if (!FixitIsWhitespaceSpan(parser, assignExpr->mOpToken->GetSrcEnd(), rhs->GetSrcStart()))
+		return false;
+	return (lhs->Equals(fieldName)) && (rhs->Equals("value"));
+}
+
+// Matches a setter whose body is exactly `<fieldName> = value;` (fat arrow, reduced block or raw block)
+static bool FixitIsValueAssignBody(BfPropertyMethodDeclaration* accessor, BfParserData* parser, const StringImpl& fieldName)
+{
+	if ((accessor == NULL) || (accessor->mNameNode == NULL))
+		return false;
+
+	int pos = accessor->mNameNode->GetSrcEnd();
+	if ((accessor->mMutSpecifier != NULL) && (accessor->mMutSpecifier->GetSrcStart() >= pos))
+	{
+		if (!FixitIsWhitespaceSpan(parser, pos, accessor->mMutSpecifier->GetSrcStart()))
+			return false;
+		pos = accessor->mMutSpecifier->GetSrcEnd();
+	}
+
+	if (accessor->mFatArrowToken != NULL)
+	{
+		auto assignExpr = BfNodeDynCast<BfAssignmentExpression>(accessor->mBody);
+		if (assignExpr == NULL)
+			return false;
+		if (!FixitIsWhitespaceSpan(parser, pos, accessor->mFatArrowToken->GetSrcStart()))
+			return false;
+		if (!FixitIsWhitespaceSpan(parser, accessor->mFatArrowToken->GetSrcEnd(), assignExpr->GetSrcStart()))
+			return false;
+		if ((accessor->mEndSemicolon != NULL) &&
+			(!FixitIsWhitespaceSpan(parser, assignExpr->GetSrcEnd(), accessor->mEndSemicolon->GetSrcStart())))
+			return false;
+		return FixitIsMatchingAssign(assignExpr, parser, fieldName);
+	}
+
+	auto block = BfNodeDynCast<BfBlock>(accessor->mBody);
+	if ((block == NULL) || (block->mOpenBrace == NULL) || (block->mCloseBrace == NULL))
+		return false;
+	if (!FixitIsWhitespaceSpan(parser, pos, block->GetSrcStart()))
+		return false;
+	int size = block->GetSize();
+	if (size == 0)
+		return false;
+
+	BfAstNode* firstNode = (*block)[0];
+	BfAssignmentExpression* assignExpr = BfNodeDynCast<BfAssignmentExpression>(firstNode);
+	if (auto exprStmt = BfNodeDynCast<BfExpressionStatement>(firstNode))
+		assignExpr = BfNodeDynCast<BfAssignmentExpression>(exprStmt->mExpression);
+	if (assignExpr != NULL)
+	{
+		if (size != 1)
+			return false;
+		if (!FixitBlockHasNoExtraText(block, parser))
+			return false;
+		return FixitIsMatchingAssign(assignExpr, parser, fieldName);
+	}
+
+	// Unreduced form: [<fieldName>][=][value][;]
+	if (size != 4)
+		return false;
+	auto lhs = BfNodeDynCastExact<BfIdentifierNode>((*block)[0]);
+	auto opToken = BfNodeDynCast<BfTokenNode>((*block)[1]);
+	auto rhs = BfNodeDynCastExact<BfIdentifierNode>((*block)[2]);
+	auto endToken = BfNodeDynCast<BfTokenNode>((*block)[3]);
+	if ((lhs == NULL) || (opToken == NULL) || (rhs == NULL) || (endToken == NULL))
+		return false;
+	if ((opToken->mToken != BfToken_AssignEquals) || (endToken->mToken != BfToken_Semicolon))
+		return false;
+	if (!FixitBlockHasNoExtraText(block, parser))
+		return false;
+	return (lhs->Equals(fieldName)) && (rhs->Equals("value"));
+}
+
+static bool FixitIsIdentifierText(const StringImpl& text)
+{
+	if (text.IsEmpty())
+		return false;
+	if (::isdigit((uint8)text[0]))
+		return false;
+	for (int i = 0; i < text.mLength; i++)
+	{
+		char c = text[i];
+		if ((!::isalnum((uint8)c)) && (c != '_') && (c != '@'))
+			return false;
+	}
+	return true;
+}
+
+static bool FixitIsSimplePathText(const StringImpl& text)
+{
+	if (text.IsEmpty())
+		return false;
+	if ((::isdigit((uint8)text[0])) || (text[0] == '.') || (text[text.mLength - 1] == '.'))
+		return false;
+	for (int i = 0; i < text.mLength; i++)
+	{
+		char c = text[i];
+		if ((!::isalnum((uint8)c)) && (c != '_') && (c != '@') && (c != '.'))
+			return false;
+	}
+	return true;
+}
+
+// Builds the edit ops for fixits that collapse a `{ ... }` body onto the declaration line
+//  (`=> expr;`, `{ get; set; }`). When the block starts on a later line, the declaration line may
+//  end with a comment - then we insert right after anchorEnd (before the comment) and delete from
+//  the line end instead of replacing a single span, so the comment doesn't swallow the insert
+bool BfAutoComplete::FixitGetCollapseReplace(BfParserData* parser, int anchorEnd, int blockStart, int deleteEnd, const StringImpl& insertText, StringImpl& outOps)
+{
+	bool isSameLine = true;
+	for (int i = anchorEnd; i < blockStart; i++)
+	{
+		char c = parser->mSrc[i];
+		if ((c == '\n') || (c == '\r'))
+		{
+			isSameLine = false;
+			break;
+		}
+	}
+
+	if (isSameLine)
+	{
+		// Only whitespace (or an inline block comment) precedes the block - replace in place
+		int deleteStart = blockStart;
+		while ((deleteStart > anchorEnd) && (::isspace((uint8)parser->mSrc[deleteStart - 1])))
+			deleteStart--;
+		outOps = StrFormat("reformat|%s-%d|%s", FixitGetLocation(parser, deleteStart).c_str(), deleteEnd - deleteStart, insertText.c_str());
+		return true;
+	}
+
+	int lineEnd = FixitGetLineEndAfter(parser, anchorEnd);
+	if (lineEnd == -1)
+		return false;
+	if (!FixitIsWhitespaceSpan(parser, lineEnd, blockStart))
+		return false;
+	// Delete from the end of the declaration line first, then insert before any trailing comment
+	outOps = StrFormat(".delete|%s-%d|", FixitGetLocation(parser, lineEnd).c_str(), deleteEnd - lineEnd);
+	outOps += "\x01";
+	outOps += StrFormat("reformat|%s|%d|%s", parser->mFileName.c_str(), anchorEnd, insertText.c_str());
+	return true;
+}
+
+void BfAutoComplete::FixitCheckPropertyBody(BfPropertyDeclaration* propertyDeclaration, BfTypeDef* typeDef)
+{
+	if (propertyDeclaration == NULL)
+		return;
+
+	bool doFixit = CheckFixit(propertyDeclaration);
+	if (propertyDeclaration->mNameNode != NULL)
+		doFixit |= CheckFixit(propertyDeclaration->mNameNode);
+	for (auto accessor : propertyDeclaration->mMethods)
+		doFixit |= CheckFixit(accessor);
+	if (!doFixit)
+		return;
+
+	BfParserData* parser = propertyDeclaration->GetSourceData()->ToParserData();
+	if (parser == NULL)
+		return;
+
+	bool isIndexer = propertyDeclaration->IsA<BfIndexerDeclaration>();
+	String propName;
+	if (propertyDeclaration->mNameNode != NULL)
+		propName = propertyDeclaration->mNameNode->ToString();
+	else if (isIndexer)
+		propName = "this[]";
+	else
+		return;
+
+	int anchorEnd = -1;
+	if (auto indexerDeclaration = BfNodeDynCast<BfIndexerDeclaration>(propertyDeclaration))
+	{
+		if (indexerDeclaration->mCloseBracket != NULL)
+			anchorEnd = indexerDeclaration->mCloseBracket->GetSrcEnd();
+	}
+	else
+		anchorEnd = propertyDeclaration->mNameNode->GetSrcEnd();
+	if (anchorEnd == -1)
+		return;
+
+	bool hasInitializer = (propertyDeclaration->mEqualsNode != NULL) || (propertyDeclaration->mInitializer != NULL) || (propertyDeclaration->mFieldDtor != NULL);
+
+	// Setters with a body are only implicitly mutating as `set;`, so in value types we generate `set mut`
+	bool setterNeedsMut = (typeDef != NULL) &&
+		((typeDef->mTypeCode == BfTypeCode_Struct) || (typeDef->mTypeCode == BfTypeCode_Enum)) &&
+		(propertyDeclaration->mStaticSpecifier == NULL);
+
+	if (auto bodyExpr = BfNodeDynCast<BfPropertyBodyExpression>(propertyDeclaration->mDefinitionBlock))
+	{
+		// Expression-bodied property `int Foo => <expr>;`
+		if ((bodyExpr->mFatTokenArrow == NULL) || (propertyDeclaration->mMethods.mSize != 1))
+			return;
+		auto getter = propertyDeclaration->mMethods[0];
+		if (getter->mBody == NULL)
+			return;
+
+		String exprStr;
+		if (!FixitEncodeSourceText(parser, getter->mBody->GetSrcStart(), getter->mBody->GetSrcEnd(), exprStr))
+			return;
+
+		int deleteStart = bodyExpr->GetSrcStart();
+		while ((deleteStart > anchorEnd) && (::isspace((uint8)parser->mSrc[deleteStart - 1])))
+			deleteStart--;
+		int deleteEnd = (getter->mEndSemicolon != NULL) ? getter->mEndSemicolon->GetSrcEnd() : propertyDeclaration->GetSrcEnd();
+		int lineEnd = FixitGetLineEndAfter(parser, deleteEnd);
+		if (lineEnd == -1)
+			return;
+
+		String getStr = "get";
+		if (bodyExpr->mMutSpecifier != NULL)
+			getStr += " mut";
+		getStr += " { return ";
+		getStr += exprStr;
+		getStr += "; }";
+
+		// Open the block at the end of the line (so trailing comments stay in place), then delete `=> <expr>;`
+		String deleteOp = StrFormat("\x01" ".delete|%s-%d|", FixitGetLocation(parser, deleteStart).c_str(), deleteEnd - deleteStart);
+
+		AddEntry(AutoCompleteEntry("fixit", StrFormat("Convert '%s' to statement body\treformat|%s|%d|\t%s\b%s",
+			propName.c_str(), parser->mFileName.c_str(), lineEnd, getStr.c_str(), deleteOp.c_str()).c_str()));
+
+		// Adding a setter requires converting to statement body form
+		String setStr;
+		if (FixitIsSimplePathText(exprStr))
+			setStr = StrFormat("\rset%s { %s = value; }\b", (setterNeedsMut) ? " mut" : "", exprStr.c_str());
+		else
+			setStr = (setterNeedsMut) ? "\rset mut\t" : "\rset\t"; // Opens a block and leaves the cursor inside
+		AddEntry(AutoCompleteEntry("fixit", StrFormat("Add 'set' accessor\treformat|%s|%d|\t%s%s%s",
+			parser->mFileName.c_str(), lineEnd, getStr.c_str(), setStr.c_str(), deleteOp.c_str()).c_str()));
+		return;
+	}
+
+	auto block = BfNodeDynCast<BfBlock>(propertyDeclaration->mDefinitionBlock);
+	if ((block == NULL) || (block->mOpenBrace == NULL) || (block->mCloseBrace == NULL))
+		return;
+
+	auto getter = propertyDeclaration->GetMethod("get");
+	auto setter = propertyDeclaration->GetMethod("set");
+
+	bool accessorsClean = true;
+	{
+		int pos = block->mOpenBrace->GetSrcEnd();
+		for (auto accessor : propertyDeclaration->mMethods)
+		{
+			if (!FixitIsWhitespaceSpan(parser, pos, accessor->GetSrcStart()))
+				accessorsClean = false;
+			pos = accessor->GetSrcEnd();
+		}
+		if (!FixitIsWhitespaceSpan(parser, pos, block->mCloseBrace->GetSrcStart()))
+			accessorsClean = false;
+	}
+
+	int deleteStart = block->mOpenBrace->GetSrcStart();
+	while ((deleteStart > anchorEnd) && (::isspace((uint8)parser->mSrc[deleteStart - 1])))
+		deleteStart--;
+	int deleteEnd = block->mCloseBrace->GetSrcEnd();
+
+	// Convert `{ get { return <expr>; } }` / `{ get => <expr>; }` to `=> <expr>;`
+	if ((propertyDeclaration->mMethods.mSize == 1) && (getter != NULL) && (!hasInitializer) && (accessorsClean) &&
+		(getter->mAttributes == NULL) && (getter->mProtectionSpecifier == NULL) && (getter->mSetRefSpecifier == NULL))
+	{
+		int exprStart = 0;
+		int exprEnd = 0;
+		if (FixitGetAccessorReturnExpr(getter, parser, &exprStart, &exprEnd))
+		{
+			String exprStr;
+			if (FixitEncodeSourceText(parser, exprStart, exprEnd, exprStr))
+			{
+				String insertText = StrFormat(" %s=> %s;", (getter->mMutSpecifier != NULL) ? "mut " : "", exprStr.c_str());
+				String ops;
+				if (FixitGetCollapseReplace(parser, anchorEnd, block->mOpenBrace->GetSrcStart(), deleteEnd, insertText, ops))
+				{
+					AddEntry(AutoCompleteEntry("fixit", StrFormat("Convert '%s' to expression body\t%s",
+						propName.c_str(), ops.c_str()).c_str()));
+				}
+			}
+		}
+	}
+
+	// Add 'set' accessor
+	if ((getter != NULL) && (setter == NULL))
+	{
+		bool isMultiLine = false;
+		for (int i = block->mOpenBrace->GetSrcEnd(); i < block->mCloseBrace->GetSrcStart(); i++)
+		{
+			if (parser->mSrc[i] == '\n')
+			{
+				isMultiLine = true;
+				break;
+			}
+		}
+
+		int insertPos = -1;
+		for (auto accessor : propertyDeclaration->mMethods)
+			insertPos = BF_MAX(insertPos, accessor->GetSrcEnd());
+		if (insertPos != -1)
+		{
+			if (isMultiLine)
+			{
+				// Insert at the end of the line so trailing comments stay attached to the getter
+				int lineEnd = FixitGetLineEndAfter(parser, insertPos);
+				if (lineEnd != -1)
+					insertPos = lineEnd;
+			}
+
+			String accStr;
+			int exprStart = 0;
+			int exprEnd = 0;
+			String exprStr;
+			if (getter->mBody == NULL)
+				accStr = "set;";
+			else if ((FixitGetAccessorReturnExpr(getter, parser, &exprStart, &exprEnd)) &&
+				(FixitEncodeSourceText(parser, exprStart, exprEnd, exprStr)) && (FixitIsSimplePathText(exprStr)))
+				accStr = StrFormat("set%s { %s = value; }", (setterNeedsMut) ? " mut" : "", exprStr.c_str());
+			else if (isMultiLine)
+				accStr = (setterNeedsMut) ? "set mut\t" : "set\t"; // Opens a block and leaves the cursor inside
+			else
+				accStr = (setterNeedsMut) ? "set mut { }" : "set { }"; // Opening a block mid-line would scramble the rest of the line
+
+			String insertStr = (isMultiLine) ? "\f" : " ";
+			insertStr += accStr;
+			AddEntry(AutoCompleteEntry("fixit", StrFormat("Add 'set' accessor\taddMethod|%s|%d|%s",
+				parser->mFileName.c_str(), insertPos, insertStr.c_str()).c_str()));
+		}
+	}
+
+	// Convert individual accessors between statement body and expression body
+	for (auto accessor : propertyDeclaration->mMethods)
+	{
+		if (!CheckFixit(accessor))
+			continue;
+		if (accessor->mNameNode == NULL)
+			continue;
+		String accName = accessor->mNameNode->ToString();
+		bool isGet = accName == "get";
+		if ((!isGet) && (accName != "set"))
+			continue;
+
+		int accAnchorEnd = accessor->mNameNode->GetSrcEnd();
+		if ((accessor->mSetRefSpecifier != NULL) && (accessor->mSetRefSpecifier->GetSrcEnd() > accAnchorEnd))
+			accAnchorEnd = accessor->mSetRefSpecifier->GetSrcEnd();
+		if ((accessor->mMutSpecifier != NULL) && (accessor->mMutSpecifier->GetSrcEnd() > accAnchorEnd))
+			accAnchorEnd = accessor->mMutSpecifier->GetSrcEnd();
+
+		if (accessor->mFatArrowToken != NULL)
+		{
+			// `get => <expr>;` -> `get { return <expr>; }`, `set => <expr>;` -> `set { <expr>; }`
+			if (accessor->mBody == NULL)
+				continue;
+			if (!FixitIsWhitespaceSpan(parser, accAnchorEnd, accessor->mFatArrowToken->GetSrcStart()))
+				continue;
+			if (!FixitIsWhitespaceSpan(parser, accessor->mFatArrowToken->GetSrcEnd(), accessor->mBody->GetSrcStart()))
+				continue;
+			if ((accessor->mEndSemicolon != NULL) &&
+				(!FixitIsWhitespaceSpan(parser, accessor->mBody->GetSrcEnd(), accessor->mEndSemicolon->GetSrcStart())))
+				continue;
+
+			String exprStr;
+			if (!FixitEncodeSourceText(parser, accessor->mBody->GetSrcStart(), accessor->mBody->GetSrcEnd(), exprStr))
+				continue;
+
+			int accDeleteStart = accessor->mFatArrowToken->GetSrcStart();
+			while ((accDeleteStart > accAnchorEnd) && (::isspace((uint8)parser->mSrc[accDeleteStart - 1])))
+				accDeleteStart--;
+			int accDeleteEnd = (accessor->mEndSemicolon != NULL) ? accessor->mEndSemicolon->GetSrcEnd() : accessor->GetSrcEnd();
+
+			AddEntry(AutoCompleteEntry("fixit", StrFormat("Convert '%s.%s' to statement body\treformat|%s-%d| { %s%s; }",
+				propName.c_str(), accName.c_str(), FixitGetLocation(parser, accDeleteStart).c_str(), accDeleteEnd - accDeleteStart,
+				(isGet) ? "return " : "", exprStr.c_str()).c_str()));
+		}
+		else if (auto accBlock = BfNodeDynCast<BfBlock>(accessor->mBody))
+		{
+			// `get { return <expr>; }` -> `get => <expr>;`, `set { <expr>; }` -> `set => <expr>;`
+			if ((accBlock->mOpenBrace == NULL) || (accBlock->mCloseBrace == NULL))
+				continue;
+
+			int exprStart = 0;
+			int exprEnd = 0;
+			bool hasExpr;
+			if (isGet)
+				hasExpr = FixitGetBlockReturnExpr(accBlock, parser, &exprStart, &exprEnd);
+			else
+				hasExpr = FixitGetBlockSingleExprStmt(accBlock, parser, &exprStart, &exprEnd);
+			if (!hasExpr)
+				continue;
+
+			String exprStr;
+			if (!FixitEncodeSourceText(parser, exprStart, exprEnd, exprStr))
+				continue;
+
+			String insertText = StrFormat(" => %s;", exprStr.c_str());
+			String ops;
+			if (FixitGetCollapseReplace(parser, accAnchorEnd, accBlock->mOpenBrace->GetSrcStart(), accBlock->mCloseBrace->GetSrcEnd(), insertText, ops))
+			{
+				AddEntry(AutoCompleteEntry("fixit", StrFormat("Convert '%s.%s' to expression body\t%s",
+					propName.c_str(), accName.c_str(), ops.c_str()).c_str()));
+			}
+		}
+	}
+
+	if ((typeDef == NULL) || (isIndexer) || (propertyDeclaration->mNameNode == NULL) ||
+		(typeDef->mTypeCode == BfTypeCode_Interface) || (!accessorsClean) || (hasInitializer))
+		return;
+
+	// Expand `{ get; set; }` into a backing field with full accessors
+	if ((propertyDeclaration->mTypeRef != NULL) && (propertyDeclaration->mMethods.mSize >= 1) &&
+		(typeDef->HasAutoProperty(propertyDeclaration)))
+	{
+		bool accessorsOk = true;
+		for (auto accessor : propertyDeclaration->mMethods)
+		{
+			if ((accessor->mBody != NULL) || (accessor->mAttributes != NULL) || (accessor->mSetRefSpecifier != NULL) || (accessor->mNameNode == NULL))
+				accessorsOk = false;
+		}
+
+		String typeStr;
+		if ((accessorsOk) &&
+			(FixitEncodeSourceText(parser, propertyDeclaration->mTypeRef->GetSrcStart(), propertyDeclaration->mTypeRef->GetSrcEnd(), typeStr)))
+		{
+			String fieldName = "_";
+			fieldName += propName;
+			fieldName[1] = (char)::tolower((uint8)fieldName[1]);
+
+			bool nameCollision = false;
+			for (auto checkFieldDef : typeDef->mFields)
+			{
+				if (checkFieldDef->mName == fieldName)
+					nameCollision = true;
+			}
+
+			if (!nameCollision)
+			{
+				String accStr;
+				bool valid = true;
+				for (auto accessor : propertyDeclaration->mMethods)
+				{
+					String accName = accessor->mNameNode->ToString();
+					String line;
+					if (accessor->mProtectionSpecifier != NULL)
+					{
+						line += accessor->mProtectionSpecifier->ToString();
+						line += " ";
+					}
+					line += accName;
+					bool wantsMut = accessor->mMutSpecifier != NULL;
+					if ((accName == "set") && (setterNeedsMut))
+						wantsMut = true;
+					if (wantsMut)
+						line += " mut";
+					if (accName == "get")
+						line += StrFormat(" { return %s; }", fieldName.c_str());
+					else if (accName == "set")
+						line += StrFormat(" { %s = value; }", fieldName.c_str());
+					else
+					{
+						valid = false;
+						break;
+					}
+					if (!accStr.IsEmpty())
+						accStr += "\r";
+					accStr += line;
+				}
+
+				int lineEnd = FixitGetLineEndAfter(parser, deleteEnd);
+				if ((valid) && (lineEnd != -1))
+				{
+					String fixitStr = StrFormat("Expand auto property '%s'\t", propName.c_str());
+					// Open the accessor block at the end of the line (so trailing comments stay in place),
+					//  then delete `{ get; set; }`, then insert the field above. Edits are ordered
+					//  from the highest file position to the lowest so they don't shift each other
+					fixitStr += StrFormat("reformat|%s|%d|\t%s\b", parser->mFileName.c_str(), lineEnd, accStr.c_str());
+					fixitStr += "\x01";
+					fixitStr += StrFormat(".delete|%s-%d|", FixitGetLocation(parser, deleteStart).c_str(), deleteEnd - deleteStart);
+					int fieldInsertPos = BfFixitFinder::FindLineStartBefore(propertyDeclaration) - 1;
+					if (fieldInsertPos < 0)
+						fieldInsertPos = 0;
+					fixitStr += "\x01";
+					fixitStr += StrFormat(".reformat|%s|%d|\f%s%s %s;", parser->mFileName.c_str(), fieldInsertPos,
+						(propertyDeclaration->mStaticSpecifier != NULL) ? "static " : "", typeStr.c_str(), fieldName.c_str());
+					AddEntry(AutoCompleteEntry("fixit", fixitStr.c_str()));
+				}
+			}
+		}
+	}
+
+	// Convert a trivial property with backing field to `{ get; set; }`
+	if ((propertyDeclaration->mExternSpecifier == NULL) &&
+		((propertyDeclaration->mVirtualSpecifier == NULL) || (propertyDeclaration->mVirtualSpecifier->GetToken() != BfToken_Abstract)) &&
+		((propertyDeclaration->mMethods.mSize == 1) || (propertyDeclaration->mMethods.mSize == 2)) &&
+		(getter != NULL) && (getter->mAttributes == NULL) && (getter->mSetRefSpecifier == NULL))
+	{
+		int exprStart = 0;
+		int exprEnd = 0;
+		String fieldName;
+		bool matched = (FixitGetAccessorReturnExpr(getter, parser, &exprStart, &exprEnd)) &&
+			(FixitEncodeSourceText(parser, exprStart, exprEnd, fieldName)) &&
+			(FixitIsIdentifierText(fieldName));
+
+		if ((matched) && (propertyDeclaration->mMethods.mSize == 2))
+		{
+			matched = (setter != NULL) && (setter->mAttributes == NULL) && (setter->mSetRefSpecifier == NULL) &&
+				(FixitIsValueAssignBody(setter, parser, fieldName));
+		}
+
+		BfFieldDeclaration* fieldDecl = NULL;
+		if (matched)
+		{
+			for (auto checkFieldDef : typeDef->mFields)
+			{
+				if ((checkFieldDef->mName == fieldName) && (!checkFieldDef->mIsProperty))
+				{
+					auto checkFieldDecl = BfNodeDynCast<BfFieldDeclaration>(checkFieldDef->mFieldDeclaration);
+					if ((checkFieldDecl != NULL) && (checkFieldDecl->GetSourceData() == propertyDeclaration->GetSourceData()))
+						fieldDecl = checkFieldDecl;
+				}
+			}
+		}
+
+		if ((fieldDecl != NULL) &&
+			(fieldDecl->mEqualsNode == NULL) && (fieldDecl->mInitializer == NULL) && (fieldDecl->mPrecedingComma == NULL) &&
+			(fieldDecl->mFieldDtor == NULL) && (fieldDecl->mConstSpecifier == NULL) && (fieldDecl->mAttributes == NULL) &&
+			(fieldDecl->mVolatileSpecifier == NULL) && (fieldDecl->mExternSpecifier == NULL) &&
+			((fieldDecl->mStaticSpecifier != NULL) == (propertyDeclaration->mStaticSpecifier != NULL)))
+		{
+			// The field's line may only contain the declaration and its terminating semicolon
+			int fieldLineStart = BfFixitFinder::FindLineStartBefore(fieldDecl);
+			int fieldLineEnd = BfFixitFinder::FindLineStartAfter(fieldDecl);
+			if (fieldLineStart < 0)
+				fieldLineStart = 0;
+
+			bool lineOk = FixitIsWhitespaceSpan(parser, fieldLineStart, fieldDecl->GetSrcStart());
+			int semicolonCount = 0;
+			for (int i = fieldDecl->GetSrcEnd(); i < fieldLineEnd; i++)
+			{
+				char c = parser->mSrc[i];
+				if (c == ';')
+					semicolonCount++;
+				else if (!::isspace((uint8)c))
+					lineOk = false;
+			}
+			if ((lineOk) && (semicolonCount <= 1))
+			{
+				String accStr = " { ";
+				for (auto accessor : propertyDeclaration->mMethods)
+				{
+					if (accessor->mProtectionSpecifier != NULL)
+					{
+						accStr += accessor->mProtectionSpecifier->ToString();
+						accStr += " ";
+					}
+					accStr += accessor->mNameNode->ToString();
+					if (accessor->mMutSpecifier != NULL)
+						accStr += " mut";
+					accStr += "; ";
+				}
+				accStr += "}";
+
+				String replaceOps;
+				if (FixitGetCollapseReplace(parser, anchorEnd, block->mOpenBrace->GetSrcStart(), deleteEnd, accStr, replaceOps))
+				{
+					String fixitStr = StrFormat("Convert '%s' to auto property\t", propName.c_str());
+					String deleteOp = StrFormat(".delete|%s-%d|", FixitGetLocation(parser, fieldLineStart).c_str(), fieldLineEnd - fieldLineStart);
+					// Apply the edit that's later in the file first so the other one isn't shifted
+					if (fieldLineStart > deleteStart)
+					{
+						fixitStr += deleteOp;
+						fixitStr += "\x01";
+						fixitStr += replaceOps;
+					}
+					else
+					{
+						fixitStr += replaceOps;
+						fixitStr += "\x01";
+						fixitStr += deleteOp;
+					}
+					AddEntry(AutoCompleteEntry("fixit", fixitStr.c_str()));
+				}
+			}
+		}
+	}
+}
+
+void BfAutoComplete::FixitCheckMethodBody(BfMethodDeclaration* methodDeclaration)
+{
+	if (methodDeclaration == NULL)
+		return;
+	if ((BfNodeIsA<BfConstructorDeclaration>(methodDeclaration)) || (BfNodeIsA<BfDestructorDeclaration>(methodDeclaration)))
+		return;
+	if ((methodDeclaration->mMixinSpecifier != NULL) || (methodDeclaration->mExternSpecifier != NULL))
+		return;
+
+	bool doFixit = CheckFixit(methodDeclaration);
+	if (methodDeclaration->mNameNode != NULL)
+		doFixit |= CheckFixit(methodDeclaration->mNameNode);
+	if (!doFixit)
+		return;
+
+	BfParserData* parser = methodDeclaration->GetSourceData()->ToParserData();
+	if (parser == NULL)
+		return;
+
+	String methodName;
+	if (methodDeclaration->mNameNode != NULL)
+		methodName = methodDeclaration->mNameNode->ToString();
+	else if (BfNodeIsA<BfOperatorDeclaration>(methodDeclaration))
+		methodName = "operator";
+	else
+		return;
+
+	bool isVoid = (methodDeclaration->mReturnType != NULL) && (methodDeclaration->mReturnType->Equals("void"));
+
+	if (methodDeclaration->mFatArrowToken != NULL)
+	{
+		// Convert `=> <expr>;` to a statement body
+		if ((methodDeclaration->mBody == NULL) || (methodDeclaration->mBody->IsA<BfBlock>()))
+			return;
+		if (!FixitIsWhitespaceSpan(parser, methodDeclaration->mFatArrowToken->GetSrcEnd(), methodDeclaration->mBody->GetSrcStart()))
+			return;
+		if ((methodDeclaration->mEndSemicolon != NULL) &&
+			(!FixitIsWhitespaceSpan(parser, methodDeclaration->mBody->GetSrcEnd(), methodDeclaration->mEndSemicolon->GetSrcStart())))
+			return;
+
+		String exprStr;
+		if (!FixitEncodeSourceText(parser, methodDeclaration->mBody->GetSrcStart(), methodDeclaration->mBody->GetSrcEnd(), exprStr))
+			return;
+
+		int deleteStart = methodDeclaration->mFatArrowToken->GetSrcStart();
+		while ((deleteStart > 0) && (::isspace((uint8)parser->mSrc[deleteStart - 1])))
+			deleteStart--;
+		int deleteEnd = (methodDeclaration->mEndSemicolon != NULL) ? methodDeclaration->mEndSemicolon->GetSrcEnd() : methodDeclaration->GetSrcEnd();
+		int lineEnd = FixitGetLineEndAfter(parser, deleteEnd);
+		if (lineEnd == -1)
+			return;
+
+		// Open the block at the end of the line (so trailing comments stay in place), then delete `=> <expr>;`
+		AddEntry(AutoCompleteEntry("fixit", StrFormat("Convert '%s' to statement body\treformat|%s|%d|\t%s%s;\b\x01" ".delete|%s-%d|",
+			methodName.c_str(), parser->mFileName.c_str(), lineEnd,
+			(isVoid) ? "" : "return ", exprStr.c_str(),
+			FixitGetLocation(parser, deleteStart).c_str(), deleteEnd - deleteStart).c_str()));
+	}
+	else if (auto block = BfNodeDynCast<BfBlock>(methodDeclaration->mBody))
+	{
+		// Convert `{ return <expr>; }` (or `{ <expr>; }` for void methods) to `=> <expr>;`
+		if ((block->mOpenBrace == NULL) || (block->mCloseBrace == NULL))
+			return;
+
+		int exprStart = 0;
+		int exprEnd = 0;
+		bool hasExpr;
+		if (isVoid)
+			hasExpr = FixitGetBlockSingleExprStmt(block, parser, &exprStart, &exprEnd);
+		else
+			hasExpr = FixitGetBlockReturnExpr(block, parser, &exprStart, &exprEnd);
+		if (!hasExpr)
+			return;
+
+		String exprStr;
+		if (!FixitEncodeSourceText(parser, exprStart, exprEnd, exprStr))
+			return;
+
+		// Everything up to the end of the signature (params, 'mut', generic constraints) stays put
+		int sigEnd = -1;
+		if (methodDeclaration->mCloseParen != NULL)
+			sigEnd = methodDeclaration->mCloseParen->GetSrcEnd();
+		if (methodDeclaration->mMutSpecifier != NULL)
+			sigEnd = BF_MAX(sigEnd, methodDeclaration->mMutSpecifier->GetSrcEnd());
+		if (methodDeclaration->mGenericConstraintsDeclaration != NULL)
+			sigEnd = BF_MAX(sigEnd, methodDeclaration->mGenericConstraintsDeclaration->GetSrcEnd());
+		if (sigEnd == -1)
+			return;
+
+		String insertText = StrFormat(" => %s;", exprStr.c_str());
+		String ops;
+		if (FixitGetCollapseReplace(parser, sigEnd, block->mOpenBrace->GetSrcStart(), block->mCloseBrace->GetSrcEnd(), insertText, ops))
+		{
+			AddEntry(AutoCompleteEntry("fixit", StrFormat("Convert '%s' to expression body\t%s",
+				methodName.c_str(), ops.c_str()).c_str()));
+		}
+	}
 }
 
 String BfAutoComplete::ConstantToString(BfIRConstHolder* constHolder, BfTypedValue typedValue)
