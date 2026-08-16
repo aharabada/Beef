@@ -210,7 +210,8 @@ static const char* gIRCmdNames[] =
 	"DbgCreateGlobalVariable",
 	"DbgCreateLexicalBlock",
 	"DbgCreateLexicalBlockFile",
-	"DbgCreateAnnotation"
+	"DbgCreateAnnotation",
+	"Call_SetDbgAnnotation"
 };
 
 BF_STATIC_ASSERT(BF_ARRAY_COUNT(gIRCmdNames) == BfIRCmd_COUNT);
@@ -2566,6 +2567,14 @@ void BeIRCodeGen::HandleNextCmd()
 			CMD_PARAM(BeValue*, callInstVal);
 			BeCallInst* callInst = (BeCallInst*)callInstVal;
 			callInst->mTailCall = true;
+		}
+		break;
+	case BfIRCmd_Call_SetDbgAnnotation:
+		{
+			CMD_PARAM(BeValue*, callInstVal);
+			CMD_PARAM(String, name);
+			if (auto callInst = BeValueDynCast<BeCallInst>(callInstVal))
+				callInst->mDbgCalleeName = name;
 		}
 		break;
 	case BfIRCmd_SetCallAttribute:

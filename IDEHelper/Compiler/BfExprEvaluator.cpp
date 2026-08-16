@@ -6644,6 +6644,25 @@ void BfExprEvaluator::CheckSkipCall(BfAstNode* targetSrc, SizedArrayImpl<BfResol
 	}
 }
 
+// Match the debugger's CreateFilterName style: hollow generic args ("List<int>" -> "List<>")
+static void BfHollowGenericNames(StringImpl& name)
+{
+	int chevronDepth = 0;
+	int writeIdx = 0;
+	for (int i = 0; i < (int)name.mLength; i++)
+	{
+		char c = name[i];
+		if (c == '>')
+			chevronDepth--;
+		bool inGeneric = chevronDepth > 0;
+		if (c == '<')
+			chevronDepth++;
+		if (!inGeneric)
+			name[writeIdx++] = c;
+	}
+	name.RemoveToEnd(writeIdx);
+}
+
 BfTypedValue BfExprEvaluator::CreateCall(BfAstNode* targetSrc, BfMethodInstance* methodInstance, BfIRValue func, bool bypassVirtual, SizedArrayImpl<BfIRValue>& irArgs, BfTypedValue* sret, BfCreateCallFlags callFlags, BfType* origTargetType)
 {
 // 	static int sCallIdx = 0;
@@ -7009,6 +7028,25 @@ BfTypedValue BfExprEvaluator::CreateCall(BfAstNode* targetSrc, BfMethodInstance*
 		}
 	}
 
+	// For indirect calls the debugger can't resolve a target name from the instruction alone,
+	//  so pass the statically-known callee along as a debug annotation (CreateFilterName style)
+	String dbgIndirectCalleeName;
+	if ((methodInstance->mVirtualTableIdx != -1) && (!bypassVirtual) && (mDeferCallData == NULL) &&
+		(!mModule->mIsComptimeModule) && (mModule->mHasFullDebugInfo))
+	{
+		dbgIndirectCalleeName = mModule->MethodToString(methodInstance,
+			(BfMethodNameFlags)(BfMethodNameFlag_ResolveGenericParamNames | BfMethodNameFlag_OmitParams | BfMethodNameFlag_NoAst));
+		BfHollowGenericNames(dbgIndirectCalleeName);
+	}
+	else if ((methodInstance->GetOwner()->IsFunction()) && (targetSrc != NULL) &&
+		(!mModule->mIsComptimeModule) && (mModule->mHasFullDebugInfo))
+	{
+		// Function-pointer call - use the source identifier text
+		dbgIndirectCalleeName = targetSrc->ToString();
+		if (dbgIndirectCalleeName.mLength > 128)
+			dbgIndirectCalleeName.Clear();
+	}
+
 	if (methodInstance->mVirtualTableIdx != -1)
 	{
 		if ((!bypassVirtual) && (mDeferCallData == NULL))
@@ -7260,6 +7298,9 @@ BfTypedValue BfExprEvaluator::CreateCall(BfAstNode* targetSrc, BfMethodInstance*
 	}
 	if ((expectCallingConvention != BfIRCallingConv_CDecl) && (!methodInstance->mIsIntrinsic))
 		mModule->mBfIRBuilder->SetCallCallingConv(callInst, expectCallingConvention);
+
+	if ((!dbgIndirectCalleeName.IsEmpty()) && (callInst))
+		mModule->mBfIRBuilder->Call_SetDbgAnnotation(callInst, dbgIndirectCalleeName);
 
 	if ((methodDef->mIsNoReturn) && (!methodInstance->mIsIntrinsic))
 		mModule->mBfIRBuilder->Call_AddAttribute(callInst, -1, BfIRAttribute_NoReturn);

@@ -434,6 +434,7 @@ void BeInliner::Visit(BeCallInst* callInst)
 	}
 	destCallInst->mNoReturn = callInst->mNoReturn;
 	destCallInst->mTailCall = callInst->mTailCall;
+	destCallInst->mDbgCalleeName = callInst->mDbgCalleeName;
 }
 
 void BeInliner::Visit(BeDbgDeclareInst* dbgDeclareInst)

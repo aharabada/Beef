@@ -1379,6 +1379,7 @@ public:
 	BfIRCallingConv mCallingConv;
 	bool mNoReturn;
 	bool mTailCall;
+	String mDbgCalleeName; // Statically-known callee for indirect calls (debug annotation)
 
 	virtual BeType* GetType() override;
 
@@ -1408,6 +1409,7 @@ public:
 		hashCtx.Mixin(mCallingConv);
 		hashCtx.Mixin(mNoReturn);
 		hashCtx.Mixin(mTailCall);
+		hashCtx.MixinStr(mDbgCalleeName);
 	}
 
 	bool HasStructRet()
@@ -2059,6 +2061,13 @@ public:
 	int mPos;
 };
 
+class BeDbgCallSite
+{
+public:
+	int mPos;
+	String mName;
+};
+
 class BeDbgFunction : public BeMDNode
 {
 public:
@@ -2088,6 +2097,7 @@ public:
 	int mPrologSize;
 	int mCodeLen;
 	Array<BeDbgCodeEmission> mEmissions;
+	Array<BeDbgCallSite> mCallSites;
 
 	int mCvTypeId;
 	int mCvFuncId;

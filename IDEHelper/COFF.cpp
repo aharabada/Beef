@@ -2208,6 +2208,7 @@ void COFF::ParseCompileUnit_Symbols(DbgCompileUnit* compileUnit, uint8* sectionD
 	blockStack.push_back(compileUnit->mGlobalBlock);
 	int deferBlockDepth = 0;
 	int deferInlineDepth = 0;
+	SizedArray<DbgCallSiteInfo, 8> pendingCallSiteInfo;
 
 	uint8* newLocationDataStart = NULL;
 	uint8* locationDataStart = NULL;
@@ -3027,6 +3028,16 @@ void COFF::ParseCompileUnit_Symbols(DbgCompileUnit* compileUnit, uint8* sectionD
 				_FinishLocationData();
 				_FlushDeferredVariableLocations();
 
+				if ((curSubprogram != NULL) && (!pendingCallSiteInfo.IsEmpty()) && (curSubprogram->mCallSiteInfo.mSize == 0))
+				{
+					int byteCount = (int)(pendingCallSiteInfo.size() * sizeof(DbgCallSiteInfo));
+					BP_ALLOC("CallSiteInfo", byteCount);
+					curSubprogram->mCallSiteInfo.mVals = (DbgCallSiteInfo*)mAlloc.AllocBytes(byteCount, alignof(DbgCallSiteInfo), "CallSiteInfo");
+					memcpy(curSubprogram->mCallSiteInfo.mVals, &pendingCallSiteInfo[0], byteCount);
+					curSubprogram->mCallSiteInfo.mSize = (int)pendingCallSiteInfo.size();
+				}
+				pendingCallSiteInfo.Clear();
+
 				// Done with forced subprogram?
 				if (useSubprogram != NULL)
 				{
@@ -3276,6 +3287,17 @@ void COFF::ParseCompileUnit_Symbols(DbgCompileUnit* compileUnit, uint8* sectionD
 		case S_COMPILE:
 			break;
 		case S_ANNOTATION:
+			{
+				// Static-callee annotation for an indirect call instruction (see BeCOFFObject)
+				ANNOTATIONSYM& annotationSym = *(ANNOTATIONSYM*)dataStart;
+				if ((!deferInternals) && (curSubprogram != NULL) && (annotationSym.csz >= 1))
+				{
+					DbgCallSiteInfo callSiteInfo;
+					callSiteInfo.mAddress = GetSectionAddr(annotationSym.seg, annotationSym.off);
+					callSiteInfo.mName = DbgDupString((const char*)annotationSym.rgsz, "DbgDupString.S_ANNOTATION");
+					pendingCallSiteInfo.Add(callSiteInfo);
+				}
+			}
 			break;
 		case S_UNAMESPACE:
 			break;

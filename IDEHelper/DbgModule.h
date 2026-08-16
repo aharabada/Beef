@@ -331,6 +331,13 @@ public:
 	Array<Entry> mEntries;
 };
 
+class DbgCallSiteInfo
+{
+public:
+	addr_target mAddress;
+	const char* mName;
+};
+
 class DbgInlineeInfo
 {
 public:
@@ -395,6 +402,7 @@ public:
 	bool mHasLineAddrGaps:1; // There are gaps of addresses which are not covered by lineinfo
 	HotReplaceKind mHotReplaceKind;
 	DbgLineInfo* mLineInfo;
+	BfSizedArray<DbgCallSiteInfo> mCallSiteInfo;
 	DbgInlineeInfo* mInlineeInfo;
 	DbgType* mParentType;
 	DbgType* mReturnType;
@@ -433,6 +441,7 @@ public:
 	void ToString(StringImpl& str, bool internalName);
 	String ToString();
 	DbgLineData* FindClosestLine(addr_target addr, DbgSubprogram** inlinedSubprogram = NULL, DbgSrcFile** srcFile = NULL, int* outLineIdx = NULL);
+	const char* FindCallSiteAnnotation(addr_target addr);
 	DbgType* GetParent();
 	DbgType* GetTargetType(); // usually mParentType except for closures
 	DbgLanguage GetLanguage();

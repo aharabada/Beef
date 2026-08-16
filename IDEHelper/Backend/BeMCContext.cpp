@@ -2020,6 +2020,7 @@ BeMCContext::BeMCContext(BeCOFFObject* coffObject) : mOut(coffObject->mTextSect.
 	mCurPhiIdx = 0;
 	mMaxCallParamCount = -1;
 	mCurDbgLoc = NULL;
+	mCurDbgCalleeNamePtr = NULL;
 	mCurVRegsInit = NULL;
 	mCurVRegsLive = NULL;
 	mUseBP = false;
@@ -3332,7 +3333,9 @@ BeMCOperand BeMCContext::CreateCall(const BeMCOperand& func, const SizedArrayImp
 		AllocInst(BeMCInstKind_MovRaw, BeMCOperand::FromReg(shadowReg.mIReg), BeMCOperand::FromReg(shadowReg.mFReg));
 	}
 
-	AllocInst(BeMCInstKind_Call, mcFunc);
+	auto mcCallInst = AllocInst(BeMCInstKind_Call, mcFunc);
+	if (mCurDbgCalleeNamePtr != NULL)
+		mDbgCallSiteNames[mcCallInst] = *mCurDbgCalleeNamePtr;
 
 	if (dynStackSize > 0)
 		AllocInst(BeMCInstKind_Add, BeMCOperand::FromReg(X64Reg_RSP), BeMCOperand::FromImmediate(dynStackSize));
@@ -15659,6 +15662,18 @@ void BeMCContext::DoCodeEmission()
 				break;
 			case BeMCInstKind_Call:
 			{
+				if ((mDbgFunction != NULL) && (!mDbgCallSiteNames.IsEmpty()))
+				{
+					String* namePtr = NULL;
+					if (mDbgCallSiteNames.TryGetValue(inst, &namePtr))
+					{
+						BeDbgCallSite dbgCallSite;
+						dbgCallSite.mPos = mOut.GetPos() - textSectStartPos;
+						dbgCallSite.mName = *namePtr;
+						mDbgFunction->mCallSites.Add(dbgCallSite);
+					}
+				}
+
 				switch (instForm)
 				{
 				case BeMCInstForm_Symbol:
@@ -18545,6 +18560,8 @@ void BeMCContext::Generate(BeFunction* function)
 							args.Add(arg.mValue);
 					}
 
+					SetAndRestoreValue<String*> prevCalleeName(mCurDbgCalleeNamePtr,
+						(!castedInst->mDbgCalleeName.IsEmpty()) ? &castedInst->mDbgCalleeName : NULL);
 					result = CreateCall(mcFunc, args, returnType, castedInst->mCallingConv, castedInst->HasStructRet(), castedInst->mNoReturn, varArgStart);
 				}
 			}

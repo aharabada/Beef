@@ -1425,6 +1425,30 @@ void BeCOFFObject::DbgGenerateModuleInfo()
 		DbgEncodeString(outS, fullName);
 		DbgSEndTag();
 
+		// Static-callee annotations for indirect calls (virtual/interface/fnptr dispatch)
+		for (auto& dbgCallSite : dbgFunc->mCallSites)
+		{
+			DbgSStartTag();
+			outS.Write((int16)S_ANNOTATION);
+
+			BeMCRelocation reloc;
+			reloc.mKind = BeMCRelocationKind_SECREL;
+			reloc.mOffset = outS.GetPos();
+			reloc.mSymTableIdx = funcSym->mIdx;
+			mDebugSSect.mRelocs.push_back(reloc);
+			outS.Write((int32)dbgCallSite.mPos); // off
+
+			reloc.mKind = BeMCRelocationKind_SECTION;
+			reloc.mOffset = outS.GetPos();
+			reloc.mSymTableIdx = funcSym->mIdx;
+			mDebugSSect.mRelocs.push_back(reloc);
+			outS.Write((int16)0); // seg
+
+			outS.Write((int16)1); // csz - one zero-terminated string
+			DbgEncodeString(outS, dbgCallSite.mName);
+			DbgSEndTag();
+		}
+
 		BeInlineLineBuilder* curInlineBuilder = NULL;
 		BeDbgLoc* curDbgLoc = NULL;
 

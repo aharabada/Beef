@@ -5617,6 +5617,12 @@ void BfIRBuilder::SetTailCall(BfIRValue callInst)
 	NEW_CMD_INSERTED;
 }
 
+void BfIRBuilder::Call_SetDbgAnnotation(BfIRValue callInst, const StringImpl& name)
+{
+	WriteCmd(BfIRCmd_Call_SetDbgAnnotation, callInst, name);
+	NEW_CMD_INSERTED;
+}
+
 void BfIRBuilder::SetCallAttribute(BfIRValue callInst, int paramIdx, BfIRAttribute attribute)
 {
 	WriteCmd(BfIRCmd_SetCallAttribute, callInst, paramIdx, attribute);

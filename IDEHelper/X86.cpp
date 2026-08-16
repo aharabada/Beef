@@ -379,9 +379,12 @@ void X86Instr::MarkRegsUsed(Array<RegForm>& regsUsed, bool overrideForm)
 	}
 }
 
-uint32 X86Instr::GetTarget(Debugger* debugger, X86CPURegisters* registers)
+uint32 X86Instr::GetTarget(Debugger* debugger, X86CPURegisters* registers, uint32* regValidMask, CPUCallTargetKind* outKind)
 {
 	const MCInstrDesc &instDesc = mX86->mInstrInfo->get(mMCInst.getOpcode());
+
+	if (outKind != NULL)
+		*outKind = CPUCallTargetKind_Static;
 
 	if (mMCInst.getNumOperands() < 1)
 		return 0;
@@ -407,7 +410,7 @@ uint32 X86Instr::GetTarget(Debugger* debugger, X86CPURegisters* registers)
 	return 0;
 }
 
-bool X86Instr::PartialSimulate(Debugger* debugger, X86CPURegisters* registers)
+bool X86Instr::PartialSimulate(Debugger* debugger, X86CPURegisters* registers, uint32* regValidMask)
 {
 	return false;
 }

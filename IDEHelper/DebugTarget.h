@@ -131,6 +131,7 @@ public:
 	bool DecodeInstruction(addr_target address, CPUInst* inst);
 	DbgBreakKind GetDbgBreakKind(addr_target address, CPURegisters* regs, intptr_target* objAddr);
 	DbgModule* FindDbgModuleForAddress(addr_target address);
+	bool IsExecutableAddress(addr_target addr);
 	DbgModule* GetMainDbgModule();
 	void ReportMemory(MemReporter* memReporter);
 };

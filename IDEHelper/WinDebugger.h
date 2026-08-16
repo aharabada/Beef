@@ -661,7 +661,7 @@ public:
 	virtual intptr GetSymbolAddress(const StringImpl& sym) override;
 	virtual String DisassembleAtRaw(intptr address) override;
 	virtual String DisassembleAt(intptr address) override;
-	virtual String FindLineCallAddresses(intptr address) override;
+	virtual String FindLineCallAddresses(intptr address, int stackFrameIdx) override;
 	virtual String GetCurrentException() override;
 	virtual void SetAliasPath(const StringImpl& origPath, const StringImpl& localPath) override;
 	virtual String GetModulesInfo() override;

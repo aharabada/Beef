@@ -374,35 +374,42 @@ bool X64Instr::IsLoadAddress()
 	return false;
 }
 
-static int ConvertRegNum(const MCOperand& operand)
+static int ConvertRegNum(unsigned regNum)
 {
-	if (!operand.isReg())
-		return -1;
-
-	switch (operand.getReg())
+	switch (regNum)
 	{
 	case llvm::X86::AL:
 	case llvm::X86::AH:
+	case llvm::X86::AX:
 	case llvm::X86::EAX:
 	case llvm::X86::RAX:
 		return X64Reg_RAX;
 	case llvm::X86::CL:
 	case llvm::X86::CH:
+	case llvm::X86::CX:
 	case llvm::X86::ECX:
 	case llvm::X86::RCX:
 		return X64Reg_RCX;
 	case llvm::X86::DL:
 	case llvm::X86::DH:
+	case llvm::X86::DX:
 	case llvm::X86::EDX:
 	case llvm::X86::RDX:
 		return X64Reg_RDX;
 	case llvm::X86::BL:
 	case llvm::X86::BH:
+	case llvm::X86::BX:
 	case llvm::X86::EBX:
 	case llvm::X86::RBX:
 		return X64Reg_RBX;
+	case llvm::X86::BPL:
+	case llvm::X86::BP:
+	case llvm::X86::EBP:
 	case llvm::X86::RBP:
 		return X64Reg_RBP;
+	case llvm::X86::SPL:
+	case llvm::X86::SP:
+	case llvm::X86::ESP:
 	case llvm::X86::RSP:
 		return X64Reg_RSP;
 
@@ -514,6 +521,13 @@ static int ConvertRegNum(const MCOperand& operand)
 	}
 
 	return -1;
+}
+
+static int ConvertRegNum(const MCOperand& operand)
+{
+	if (!operand.isReg())
+		return -1;
+	return ConvertRegNum((unsigned)operand.getReg());
 }
 
 bool X64Instr::GetIndexRegisterAndOffset(int* outRegister, int* outOffset)
@@ -703,25 +717,65 @@ void X64Instr::MarkRegsUsed(Array<RegForm>& regsUsed, bool overrideForm)
 	}
 }
 
-uint64 X64Instr::GetTarget(Debugger* debugger, X64CPURegisters* registers)
+uint64 X64Instr::GetTarget(Debugger* debugger, X64CPURegisters* registers, uint32* regValidMask, CPUCallTargetKind* outKind)
 {
 	const MCInstrDesc &instDesc = mX64->mInstrInfo->get(mMCInst.getOpcode());
+
+	if (outKind != NULL)
+		*outKind = CPUCallTargetKind_Static;
 
 	if (mMCInst.getNumOperands() < 1)
 		return 0;
 
-	/*if ((debugger != NULL) && (registers != NULL))
+	if (debugger != NULL)
 	{
 		int regNum = 0;
 		int offset = 0;
 		if (GetIndexRegisterAndOffset(&regNum, &offset))
 		{
-			uint64 addr = registers->mIntRegsArray[regNum] + offset;
-			uint64 val = 0;
-			debugger->ReadMemory(addr, 8, &val);
-			return val;
+			if (regNum == X64Reg_RIP)
+			{
+				// RIP-relative addressing is relative to the END of the instruction - don't
+				//  use the walked register state (PC is set to the instruction start there)
+				if (outKind != NULL)
+					*outKind = CPUCallTargetKind_RipMem;
+				uint64 memAddr = mAddress + (uint64)mSize + (int64)offset;
+				uint64 val = 0;
+				if ((debugger->ReadMemory(memAddr, sizeof(val), &val)) && (val != 0))
+					return val;
+				return 0;
+			}
+
+			// call [reg+disp] - only resolvable when the walked register state is trusted
+			if (outKind != NULL)
+				*outKind = CPUCallTargetKind_Indirect;
+			if ((registers != NULL) && (regValidMask != NULL) &&
+				(regNum >= X64Reg_RAX) && (regNum <= X64Reg_R15) &&
+				((*regValidMask & ((uint32)1 << regNum)) != 0))
+			{
+				uint64 memAddr = (uint64)registers->mIntRegsArray[regNum] + (int64)offset;
+				uint64 val = 0;
+				if ((debugger->ReadMemory(memAddr, sizeof(val), &val)) && (val != 0))
+					return val;
+			}
+			return 0;
 		}
-	}*/
+
+		// call r64 (the register itself holds the target)
+		if ((registers != NULL) && (regValidMask != NULL) && (IsCall()) &&
+			(instDesc.operands()[0].OperandType == MCOI::OPERAND_REGISTER))
+		{
+			int callRegNum = ConvertRegNum(mMCInst.getOperand(0));
+			if ((callRegNum >= X64Reg_RAX) && (callRegNum <= X64Reg_R15))
+			{
+				if (outKind != NULL)
+					*outKind = CPUCallTargetKind_Indirect;
+				if ((*regValidMask & ((uint32)1 << callRegNum)) != 0)
+					return (uint64)registers->mIntRegsArray[callRegNum];
+				return 0;
+			}
+		}
+	}
 
 	int opIdx = 0;
 	auto operand = mMCInst.getOperand(0);
@@ -744,68 +798,95 @@ uint64 X64Instr::GetTarget(Debugger* debugger, X64CPURegisters* registers)
 	return 0;
 }
 
-bool X64Instr::PartialSimulate(Debugger* debugger, X64CPURegisters* registers)
+// Minimal forward simulation used by the line-call walk: keeps 'regValidMask' (bits are
+//  1 << X64Reg_RAX..X64Reg_R15) in sync with which entries of mIntRegsArray can be trusted.
+//  Only plain 64-bit register copies and [base+disp] loads are modeled; everything else
+//  conservatively invalidates the registers it writes.
+bool X64Instr::PartialSimulate(Debugger* debugger, X64CPURegisters* registers, uint32* regValidMask)
 {
-//	const MCInstrDesc &instDesc = mX64->mInstrInfo->get(mMCInst.getOpcode());
-//
-//	for (int i = 0; i < instDesc.NumOperands; i++)
-//	{
-//		auto regInfo = mMCInst.getOperand(i);
-//		NOP;
-//	}
-//
-//	if (instDesc.getOpcode() == X86::MOV64rm)
-//	{
-//		auto form = (instDesc.TSFlags & llvm::X86II::FormMask);
-//
-//		if ((form == llvm::X86II::MRMSrcMem) && (instDesc.NumOperands == 6))
-//		{
-//			auto destReg = mMCInst.getOperand(llvm::X86::AddrBaseReg);
-//			if (destReg.isReg())
-//			{
-//				int regNum = 0;
-//				int offset = 0;
-//				if (GetIndexRegisterAndOffset(&regNum, &offset))
-//				{
-//					uint64 addr = registers->mIntRegsArray[regNum] + offset;
-//					uint64 val = 0;
-//					debugger->ReadMemory(addr, 8, &val);
-//
-//					switch (destReg.getReg())
-//					{
-//
-//					}
-//				}
-//			}
-//		}
-//
-//// 		if ((form == llvm::X86II::MRMDestMem) || (form == llvm::X86II::MRMSrcMem) ||
-//// 			((form >= llvm::X86II::MRM0m) && (form <= llvm::X86II::MRM7m)))
-//// 		{
-//// 		}
-//	}
-//
-//	if (instDesc.getOpcode() == X86::XOR8rr)
-//	{
-//		if (instDesc.NumOperands == 3)
-//		{
-//			auto destReg = mMCInst.getOperand(0);
-//			auto srcReg = mMCInst.getOperand(1);
-//
-//			if ((destReg.isReg()) && (srcReg.isReg()))
-//			{
-//				if (destReg.getReg() == srcReg.getReg())
-//				{
-//					switch (destReg.getReg())
-//					{
-//					case X86::AL:
-//						((uint8*)&registers->mIntRegs.rax)[0] = 0;
-//						break;
-//					}
-//				}
-//			}
-//		}
-//	}
+	if (regValidMask == NULL)
+		return false;
+
+	const MCInstrDesc& instDesc = mX64->mInstrInfo->get(mMCInst.getOpcode());
+	auto opcode = mMCInst.getOpcode();
+
+	if (opcode == llvm::X86::MOV64rr)
+	{
+		int destReg = ConvertRegNum(mMCInst.getOperand(0));
+		int srcReg = ConvertRegNum(mMCInst.getOperand(1));
+		if ((destReg >= X64Reg_RAX) && (destReg <= X64Reg_R15) &&
+			(srcReg >= X64Reg_RAX) && (srcReg <= X64Reg_R15))
+		{
+			registers->mIntRegsArray[destReg] = registers->mIntRegsArray[srcReg];
+			if ((*regValidMask & ((uint32)1 << srcReg)) != 0)
+				*regValidMask |= ((uint32)1 << destReg);
+			else
+				*regValidMask &= ~((uint32)1 << destReg);
+			return true;
+		}
+	}
+
+	if ((opcode == llvm::X86::MOV64rm) && (debugger != NULL))
+	{
+		// MRMSrcMem: destination is operand 0, the memory 5-tuple follows
+		int destReg = ConvertRegNum(mMCInst.getOperand(0));
+		if ((destReg >= X64Reg_RAX) && (destReg <= X64Reg_R15))
+		{
+			int baseReg = 0;
+			int offset = 0;
+			uint64 memAddr = 0;
+			bool addrKnown = false;
+			if (GetIndexRegisterAndOffset(&baseReg, &offset))
+			{
+				if (baseReg == X64Reg_RIP)
+				{
+					memAddr = mAddress + (uint64)mSize + (int64)offset;
+					addrKnown = true;
+				}
+				else if ((baseReg >= X64Reg_RAX) && (baseReg <= X64Reg_R15) &&
+					((*regValidMask & ((uint32)1 << baseReg)) != 0))
+				{
+					memAddr = (uint64)registers->mIntRegsArray[baseReg] + (int64)offset;
+					addrKnown = true;
+				}
+			}
+
+			uint64 val = 0;
+			if ((addrKnown) && (debugger->ReadMemory(memAddr, sizeof(val), &val)))
+			{
+				registers->mIntRegsArray[destReg] = (int64)val;
+				*regValidMask |= ((uint32)1 << destReg);
+				return true;
+			}
+
+			*regValidMask &= ~((uint32)1 << destReg); // Load we couldn't follow
+			return false;
+		}
+	}
+
+	// Conservative default: every explicit and implicit def loses trust
+	int numDefs = (int)instDesc.getNumDefs(); // Defs are the first operands
+	for (int defIdx = 0; defIdx < numDefs; defIdx++)
+	{
+		int regNum = ConvertRegNum(mMCInst.getOperand(defIdx));
+		if ((regNum >= X64Reg_RAX) && (regNum <= X64Reg_R15))
+			*regValidMask &= ~((uint32)1 << regNum);
+	}
+	for (auto implReg : instDesc.implicit_defs())
+	{
+		int regNum = ConvertRegNum((unsigned)implReg);
+		if ((regNum >= X64Reg_RAX) && (regNum <= X64Reg_R15))
+			*regValidMask &= ~((uint32)1 << regNum);
+	}
+
+	if (IsCall())
+	{
+		// MC-level call descs don't carry the ABI clobber set - clear the Win64 volatiles explicitly
+		const uint32 kVolatileMask =
+			((uint32)1 << X64Reg_RAX) | ((uint32)1 << X64Reg_RCX) | ((uint32)1 << X64Reg_RDX) |
+			((uint32)1 << X64Reg_R8) | ((uint32)1 << X64Reg_R9) | ((uint32)1 << X64Reg_R10) | ((uint32)1 << X64Reg_R11);
+		*regValidMask &= ~kVolatileMask;
+	}
 
 	return false;
 }

@@ -119,6 +119,16 @@ void DbgSubprogram::PopulateSubprogram()
 	mCompileUnit->mDbgModule->PopulateSubprogram(this);
 }
 
+const char* DbgSubprogram::FindCallSiteAnnotation(addr_target addr)
+{
+	for (int idx = 0; idx < mCallSiteInfo.mSize; idx++)
+	{
+		if (mCallSiteInfo.mVals[idx].mAddress == addr)
+			return mCallSiteInfo.mVals[idx].mName;
+	}
+	return NULL;
+}
+
 //////////////////////////////////////////////////////////////////////////
 
 DbgLineDataBuilder::DbgLineDataBuilder(DbgModule* dbgModule)

@@ -49,3 +49,10 @@ enum RegForm : int8
 	RegForm_Double2,
 	RegForm_Double4,
 };
+
+enum CPUCallTargetKind : int8
+{
+	CPUCallTargetKind_Static,   // rel32 / immediate - target encoded in the instruction
+	CPUCallTargetKind_RipMem,   // call [rip+X] - address statically exact, value read from debuggee memory
+	CPUCallTargetKind_Indirect  // call r64 / call [reg+disp] - derived from walked register state
+};

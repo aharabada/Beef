@@ -352,7 +352,7 @@ public:
 	virtual intptr GetSymbolAddress(const StringImpl& sym) { return 0; }
 	virtual String DisassembleAtRaw(intptr address) = 0;
 	virtual String DisassembleAt(intptr address) = 0;
-	virtual String FindLineCallAddresses(intptr address) = 0;
+	virtual String FindLineCallAddresses(intptr address, int stackFrameIdx) = 0;
 	virtual String GetCurrentException() = 0;
 	virtual String GetModulesInfo() = 0;
 	virtual String GetModuleInfo(const StringImpl& moduleName) { return ""; }

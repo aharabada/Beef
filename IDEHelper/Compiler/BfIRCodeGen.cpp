@@ -4546,6 +4546,14 @@ void BfIRCodeGen::HandleNextCmd()
 			((llvm::CallInst*)callInst)->setTailCall();
 		}
 		break;
+	case BfIRCmd_Call_SetDbgAnnotation:
+		{
+			// Static-callee debug annotations (S_ANNOTATION) are only supported by the Beef
+			//  backend - read and ignore here
+			CMD_PARAM(llvm::Value*, callInst);
+			CMD_PARAM(String, name);
+		}
+		break;
 	case BfIRCmd_SetCallAttribute:
 		{
 			CMD_PARAM(llvm::Value*, callInst);

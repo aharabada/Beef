@@ -2535,6 +2535,26 @@ DbgModule* DebugTarget::FindDbgModuleForAddress(addr_target address)
 	return NULL;
 }
 
+bool DebugTarget::IsExecutableAddress(addr_target addr)
+{
+	auto dbgModule = FindDbgModuleForAddress(addr);
+	if (dbgModule == NULL)
+		return false;
+	if (dbgModule->mSections.IsEmpty())
+		return true; // No section info available - don't over-reject
+	for (int i = 0; i < (int)dbgModule->mSections.size(); i++)
+	{
+		auto section = &dbgModule->mSections[i];
+		if ((addr >= section->mAddrStart + dbgModule->mImageBase) &&
+			(addr < section->mAddrStart + dbgModule->mImageBase + section->mAddrLength))
+		{
+			if (section->mIsExecutable)
+				return true;
+		}
+	}
+	return false;
+}
+
 DbgModule* DebugTarget::GetMainDbgModule()
 {
 	return mTargetBinary;

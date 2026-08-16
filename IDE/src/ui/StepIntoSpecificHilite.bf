@@ -275,9 +275,10 @@ namespace IDE.ui
 			List<int32> heuristicEntries = scope .();
 
 			// Pass A: exact positions from the debug info (expression-level source positions).
-			// For named candidates the column is a disambiguator, never sole authority: the
-			// name-compatibility check protects against coarse statement columns from older
-			// debug info or LLVM builds. Nameless (indirect) candidates only carry a column
+			// For matchable named candidates the column is a disambiguator, never sole authority:
+			// the name-compatibility check protects against coarse statement columns from older
+			// debug info or LLVM builds. Nameless candidates and named-but-unmatchable ones
+			// (destructors from call-site annotations, conversion operators) only carry a column
 			// when it came from our own same-line emission, so they bind without a check.
 			for (int entryIdx < entries.Count)
 			{
@@ -293,45 +294,42 @@ namespace IDE.ui
 						keyValid = !(key case .Unmatchable);
 					}
 
-					if ((call.mName == null) || (keyValid))
+					int wantIdx = lineStart + call.mColumn;
+					for (int tokenIdx < tokens.Count)
 					{
-						int wantIdx = lineStart + call.mColumn;
-						for (int tokenIdx < tokens.Count)
+						var token = ref tokens[tokenIdx];
+						if ((wantIdx < token.mTextIdx) || (wantIdx >= token.mTextIdx + token.mLength))
+							continue;
+
+						if (keyValid)
 						{
-							var token = ref tokens[tokenIdx];
-							if ((wantIdx < token.mTextIdx) || (wantIdx >= token.mTextIdx + token.mLength))
-								continue;
-
-							if (keyValid)
+							bool compat = false;
+							for (int pass < 2)
 							{
-								bool compat = false;
-								for (int pass < 2)
+								if (TokenMatches(token, key, pass))
 								{
-									if (TokenMatches(token, key, pass))
-									{
-										compat = true;
-										break;
-									}
+									compat = true;
+									break;
 								}
-								if (!compat)
-									break; // Wrong token under this column - leave for the heuristic pass
 							}
-
-							if (!token.mClaimed)
-							{
-								token.mClaimed = true;
-								Span span;
-								span.mTextIdx = token.mTextIdx;
-								span.mLength = token.mLength;
-								token.mSpanIdx = (int32)spans.Count;
-								spans.Add(span);
-							}
-							// Any number of candidates may share one token (e.g. property get/set
-							// pairs, or the delete keyword's destructor call)
-							entries[entryIdx].mSpanIdx = token.mSpanIdx;
-							matched = true;
-							break;
+							if (!compat)
+								break; // Wrong token under this column - leave for the heuristic pass
 						}
+
+						if (!token.mClaimed)
+						{
+							token.mClaimed = true;
+							Span span;
+							span.mTextIdx = token.mTextIdx;
+							span.mLength = token.mLength;
+							token.mSpanIdx = (int32)spans.Count;
+							spans.Add(span);
+						}
+						// Any number of candidates may share one token (e.g. property get/set
+						// pairs, or the delete keyword's destructor call)
+						entries[entryIdx].mSpanIdx = token.mSpanIdx;
+						matched = true;
+						break;
 					}
 				}
 				if (!matched)

@@ -324,7 +324,7 @@ public:
 	virtual String GetAddressSymbolName(intptr address, bool demangle) override;
 	virtual String DisassembleAtRaw(intptr address) override;
 	virtual String DisassembleAt(intptr address) override;
-	virtual String FindLineCallAddresses(intptr address) override;
+	virtual String FindLineCallAddresses(intptr address, int stackFrameIdx) override;
 	virtual String GetCurrentException() override;
 	virtual String GetModulesInfo() override;
 	virtual void SetAliasPath(const StringImpl& origPath, const StringImpl& localPath) override;

@@ -355,7 +355,7 @@ namespace IDE.Debugger
 		static extern char8* Debugger_GetAddressSymbolName(int addr, bool demangle);
 
 		[CallingConvention(.Stdcall),CLink]
-		static extern char8* Debugger_FindLineCallAddresses(int addr);
+		static extern char8* Debugger_FindLineCallAddresses(int addr, int32 stackFrameIdx);
 
 		[CallingConvention(.Stdcall),CLink]
 		static extern char8* Debugger_DisassembleAt(int addr);
@@ -1145,9 +1145,9 @@ namespace IDE.Debugger
 			outCodeAddresses.Append(strPtr);
 		}
 
-		public void FindLineCallAddresses(int addr, String outCallAddresses)
+		public void FindLineCallAddresses(int addr, int32 stackFrameIdx, String outCallAddresses)
 		{
-			char8* strPtr = Debugger_FindLineCallAddresses(addr);
+			char8* strPtr = Debugger_FindLineCallAddresses(addr, stackFrameIdx);
 			outCallAddresses.Append(strPtr);
 		}
 
@@ -1155,6 +1155,7 @@ namespace IDE.Debugger
 		{
 			public int mAddr; // Address of the call instruction
 			public String mName ~ delete _; // null => unresolved indirect call
+			public String mDynTargetName ~ delete _; // null => no runtime-resolved target
 			public bool mIsPastAddr;
 			public bool mIsDefaultFiltered;
 			public bool mIsFiltered;
@@ -1164,7 +1165,14 @@ namespace IDE.Debugger
 			public void GetDisplayName(String outStr)
 			{
 				if (mName != null)
+				{
 					outStr.Append(mName);
+					if (mDynTargetName != null)
+					{
+						outStr.Append(" -> ");
+						outStr.Append(mDynTargetName);
+					}
+				}
 				else
 					outStr.AppendF("Indirect call at 0x{0:X}", mAddr);
 			}
@@ -1187,7 +1195,7 @@ namespace IDE.Debugger
 				checkAddr = GetStackFrameCalleeAddr(mActiveCallStackIdx);
 
 			String lineCallAddrs = scope .();
-			FindLineCallAddresses(checkAddr, lineCallAddrs);
+			FindLineCallAddresses(checkAddr, mActiveCallStackIdx, lineCallAddrs);
 
 			for (var callStr in lineCallAddrs.Split('\n'))
 			{
@@ -1225,6 +1233,11 @@ namespace IDE.Debugger
 						if (int32.Parse(posView.Substring(commaIdx + 1)) case .Ok(let columnVal))
 							call.mColumn = columnVal;
 					}
+				}
+				if (callData.GetNext() case .Ok(let dynNameView))
+				{
+					if (!dynNameView.IsEmpty)
+						call.mDynTargetName = new String(dynNameView);
 				}
 				outCalls.Add(call);
 			}

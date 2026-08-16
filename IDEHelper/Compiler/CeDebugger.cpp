@@ -4866,7 +4866,7 @@ String CeDebugger::DisassembleAt(intptr address)
 	return dumpCtx.mStr;
 }
 
-String CeDebugger::FindLineCallAddresses(intptr address)
+String CeDebugger::FindLineCallAddresses(intptr address, int stackFrameIdx)
 {
 	return String();
 }

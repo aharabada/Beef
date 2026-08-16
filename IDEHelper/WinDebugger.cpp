@@ -12739,8 +12739,10 @@ String WinDebugger::DisassembleAt(intptr inAddress)
 	return result;
 }
 
-String WinDebugger::FindLineCallAddresses(intptr inAddress)
+String WinDebugger::FindLineCallAddresses(intptr inAddress, int stackFrameIdx)
 {
+	AutoCrit autoCrit(mDebugManager->mCritSect); // We access mCallStack
+
 	String callAddresses;
 
 	addr_target address = (addr_target)inAddress;
@@ -12753,10 +12755,52 @@ String WinDebugger::FindLineCallAddresses(intptr inAddress)
 		return "";
 
 	CPURegisters registers;
-	PopulateRegisters(&registers);
+	uint32 seedValidMask = 0;
+	bool hasFrameRegisters = false;
+
+	int useFrameIdx = stackFrameIdx;
+	if (FixCallStackIdx(useFrameIdx))
+	{
+		UpdateCallStackMethod(useFrameIdx);
+		WdStackFrame* wdStackFrame = mCallStack[useFrameIdx];
+		memcpy(&registers, &wdStackFrame->mRegisters, sizeof(CPURegisters));
+		hasFrameRegisters = true;
+
+#ifdef BF_DBG_64
+		if (useFrameIdx == 0)
+		{
+			// Live registers - all GPRs are meaningful at inAddress (the stopped PC)
+			seedValidMask = 0xFFFF; // X64Reg_RAX..X64Reg_R15
+		}
+		else if (wdStackFrame->mInInlineMethod)
+		{
+			// Inline frame: the register values were sampled at a different instruction inside
+			//  the same physical function - only the frame-base registers can be trusted
+			seedValidMask = ((uint32)1 << X64Reg_RBP) | ((uint32)1 << X64Reg_RSP);
+		}
+		else
+		{
+			// Unwound physical frame: callee-saved registers are restored by the unwinder and
+			//  preserved across the in-flight call by the ABI; volatiles are garbage
+			seedValidMask =
+				((uint32)1 << X64Reg_RBX) | ((uint32)1 << X64Reg_RSI) | ((uint32)1 << X64Reg_RDI) |
+				((uint32)1 << X64Reg_RBP) | ((uint32)1 << X64Reg_RSP) |
+				((uint32)1 << X64Reg_R12) | ((uint32)1 << X64Reg_R13) |
+				((uint32)1 << X64Reg_R14) | ((uint32)1 << X64Reg_R15);
+		}
+#endif
+	}
+	else
+		PopulateRegisters(&registers);
+
+	uint32 regValidMask = 0; // The walk starts before inAddress - no register trust yet
+	bool regMaskSeeded = false;
+	addr_target simContinuedAddr = 0;
 
 	auto inlinerSubprogram = dwSubprogram->GetRootInlineParent();
 	FixupLineDataForSubprogram(inlinerSubprogram);
+	// Ensure call-site annotations (deferred proc internals) are loaded
+	inlinerSubprogram->PopulateSubprogram();
 
 	if (inlinerSubprogram->mLineInfo->mLines.mSize == 0)
 		return "";
@@ -12819,6 +12863,9 @@ String WinDebugger::FindLineCallAddresses(intptr inAddress)
 				posStr = StrFormat("%d,%d", checkLineData->mLine, (int)checkLineData->mColumn);
 			}
 
+			if (addr != simContinuedAddr)
+				regValidMask = 0; // Unsimulated gap (skipped section) - register trust doesn't survive it
+
 			while (addr < endAddr)
 			{
 				CPUInst inst;
@@ -12826,15 +12873,81 @@ String WinDebugger::FindLineCallAddresses(intptr inAddress)
 					break;
 
 				*registers.GetPCRegisterRef() = addr;
+
+				// Seed register trust when the walk reaches the instruction the frame is actually
+				//  at. Containment rather than equality: for outer frames inAddress is the return
+				//  address minus one, which lands INSIDE the in-flight call instruction
+				if ((hasFrameRegisters) && (!regMaskSeeded) &&
+					(addr <= (addr_target)inAddress) && ((addr_target)inAddress < addr + inst.GetLength()))
+				{
+					regValidMask = seedValidMask;
+					regMaskSeeded = true;
+				}
+
 				if (inst.IsCall())
 				{
-					// Record format: [-]addr \t name \t attrs \t line,column
-					//  ('name', 'attrs' and the position may be empty)
+					// Record format: [-]addr \t name \t attrs \t line,column \t dynName
+					//  (all fields after the address may be empty)
 					bool addRecord = true;
 					String name;
+					String dynName;
 					String attrs;
 
-					addr_target targetAddr = inst.GetTarget(this, &registers);
+					auto _ApplyUserStepFilter = [&](bool isDefaultFiltered)
+					{
+						bool isFiltered = isDefaultFiltered;
+						StepFilter* stepFilterPtr = NULL;
+						if (mDebugManager->mStepFilters.TryGetValue(name, &stepFilterPtr))
+							isFiltered = stepFilterPtr->IsFiltered(isDefaultFiltered);
+						if (isFiltered)
+							attrs += "f";  // 'f' for filter
+					};
+
+					CPUCallTargetKind targetKind = CPUCallTargetKind_Static;
+					addr_target targetAddr = (addr_target)inst.GetTarget(this, &registers, &regValidMask, &targetKind);
+					bool targetValidated = false;
+
+					if ((targetAddr != 0) && (targetKind != CPUCallTargetKind_Static))
+					{
+						// Memory/register-derived target: require a real function entry at the address
+						addr_target checkTarget = targetAddr;
+						auto targetModule = mDebugTarget->FindDbgModuleForAddress(checkTarget);
+						if ((targetModule != NULL) && (mDebugTarget->IsExecutableAddress(checkTarget)))
+						{
+							// Hot-reloaded functions start with a jump to the new version; FindSubProgram
+							//  doesn't follow thunks, so do it ourselves before validating and naming
+							if (targetModule->mOrigImageData != NULL)
+							{
+								addr_target thunkAddr = (addr_target)mCPU->DecodeThunk(checkTarget, targetModule->mOrigImageData);
+								if (thunkAddr != 0)
+									checkTarget = thunkAddr;
+							}
+
+							auto targetSubprogram = mDebugTarget->FindSubProgram(checkTarget);
+							if ((targetSubprogram != NULL) && (targetSubprogram->mBlock.mLowPC == checkTarget))
+								targetValidated = true; // Entry-exact; FindSubProgram alone matches any PC inside the body
+							else
+							{
+								String symName;
+								addr_target symOffset = 1;
+								if ((mDebugTarget->FindSymbolAt(checkTarget, &symName, &symOffset)) && (symOffset == 0))
+									targetValidated = true; // FindSymbolAt has a huge lookback - only offset 0 proves an entry
+							}
+							if (targetValidated)
+								targetAddr = checkTarget;
+						}
+
+						if (!targetValidated)
+						{
+							if (targetKind == CPUCallTargetKind_Indirect)
+								targetAddr = 0; // Unresolved -> annotation fallback
+							else if (targetModule == NULL)
+								targetAddr = 0; // RipMem keeps the lenient module-presence check
+						}
+					}
+					else if ((targetAddr != 0) && (mDebugTarget->FindDbgModuleForAddress(targetAddr) == NULL))
+						targetAddr = 0; // A static target that isn't in any loaded module is garbage
+
 					if (targetAddr != 0)
 					{
 						auto subprogram = mDebugTarget->FindSubProgram(targetAddr);
@@ -12867,23 +12980,40 @@ String WinDebugger::FindLineCallAddresses(intptr inAddress)
 						if ((addRecord) && (name.empty()))
 							name = "Func@" + EncodeDataPtr(targetAddr, false);
 
+						if ((addRecord) && (targetKind != CPUCallTargetKind_Static) && (targetValidated))
+						{
+							// The static annotation drives token matching and step filters; the
+							//  runtime-resolved name rides along as the extra wire field
+							const char* annotationName = inlinerSubprogram->FindCallSiteAnnotation(addr);
+							if (annotationName != NULL)
+							{
+								dynName = name;
+								name = annotationName;
+							}
+						}
+
 						if (addRecord)
 						{
-							bool isFiltered = false;
+							bool isDefaultFiltered = false;
 							if (subprogram != NULL)
 							{
 								subprogram->PopulateSubprogram();
-								isFiltered = subprogram->mIsStepFilteredDefault;
-								if (isFiltered)
+								isDefaultFiltered = subprogram->mIsStepFilteredDefault;
+								if (isDefaultFiltered)
 									attrs += "d"; // 'd' for default filtered
 							}
 
-							StepFilter* stepFilterPtr = NULL;
-							if (mDebugManager->mStepFilters.TryGetValue(name, &stepFilterPtr))
-								isFiltered = stepFilterPtr->IsFiltered(isFiltered);
-
-							if (isFiltered)
-								attrs += "f";  // 'f' for filter
+							_ApplyUserStepFilter(isDefaultFiltered);
+						}
+					}
+					else
+					{
+						// Indirect call - consult compiler-emitted static-callee annotations
+						const char* annotationName = inlinerSubprogram->FindCallSiteAnnotation(addr);
+						if (annotationName != NULL)
+						{
+							name = annotationName;
+							_ApplyUserStepFilter(false); // No callee subprogram -> no 'd' computation
 						}
 					}
 
@@ -12892,12 +13022,13 @@ String WinDebugger::FindLineCallAddresses(intptr inAddress)
 						if (addr < (addr_target)inAddress)
 							callAddresses += "-";
 						callAddresses += EncodeDataPtr(addr, false);
-						callAddresses += "\t" + name + "\t" + attrs + "\t" + posStr + "\n";
+						callAddresses += "\t" + name + "\t" + attrs + "\t" + posStr + "\t" + dynName + "\n";
 					}
 				}
 
-				inst.PartialSimulate(this, &registers);
+				inst.PartialSimulate(this, &registers, &regValidMask);
 				addr += inst.GetLength();
+				simContinuedAddr = addr;
 			}
 		};
 

@@ -371,6 +371,7 @@ enum BfIRCmd : uint8
 	BfIRCmd_DbgCreateLexicalBlock,
 	BfIRCmd_DbgCreateLexicalBlockFile,
 	BfIRCmd_DbgCreateAnnotation,
+	BfIRCmd_Call_SetDbgAnnotation,
 
 	BfIRCmd_COUNT
 };
@@ -1336,6 +1337,7 @@ public:
 	void SetCallCallingConv(BfIRValue callInst, BfIRCallingConv callingConv);
 	void SetFuncCallingConv(BfIRFunction func, BfIRCallingConv callingConv);
 	void SetTailCall(BfIRValue callInst);
+	void Call_SetDbgAnnotation(BfIRValue callInst, const StringImpl& name);
 	void SetCallAttribute(BfIRValue callInst, int paramIdx, BfIRAttribute attribute);
 	BfIRValue CreateRet(BfIRValue val);
 	BfIRValue CreateSetRet(BfIRValue val, int returnTypeId);

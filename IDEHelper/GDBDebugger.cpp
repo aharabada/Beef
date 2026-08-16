@@ -2167,7 +2167,7 @@ String GDBDebugger::DisassembleAt(intptr address)
 	return String();
 }
 
-String GDBDebugger::FindLineCallAddresses(intptr address)
+String GDBDebugger::FindLineCallAddresses(intptr address, int stackFrameIdx)
 {
 	return String();
 }

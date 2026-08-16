@@ -1559,10 +1559,10 @@ BF_EXPORT const char* BF_CALLTYPE Debugger_GetAddressSymbolName(intptr address, 
 	return outString.c_str();
 }
 
-BF_EXPORT const char* BF_CALLTYPE Debugger_FindLineCallAddresses(intptr address)
+BF_EXPORT const char* BF_CALLTYPE Debugger_FindLineCallAddresses(intptr address, int32 stackFrameIdx)
 {
 	String& outString = *gTLStrReturn.Get();
-	outString = gDebugger->FindLineCallAddresses(address);
+	outString = gDebugger->FindLineCallAddresses(address, stackFrameIdx);
 	return outString.c_str();
 }
 

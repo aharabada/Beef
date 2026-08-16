@@ -1257,7 +1257,7 @@ String LLDBDebugger::DisassembleAt(intptr address)
 	return String();
 }
 
-String LLDBDebugger::FindLineCallAddresses(intptr address)
+String LLDBDebugger::FindLineCallAddresses(intptr address, int stackFrameIdx)
 {
 	return String();
 }

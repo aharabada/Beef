@@ -1430,6 +1430,8 @@ public:
 	BeVTrackingList* mCurVRegsLive;
 	Array<int> mTextRelocs;
 	Array<BeMCSwitchEntry> mSwitchEntries;
+	String* mCurDbgCalleeNamePtr;
+	Dictionary<BeMCInst*, String> mDbgCallSiteNames;
 
 	Dictionary<int, X64CPURegister> mDbgPreferredRegs;
 
