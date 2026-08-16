@@ -24,10 +24,17 @@ public:
 	virtual void			Blt(ImageData* imageData, int x, int y) { }
 	virtual void			SetBits(int destX, int destY, int destWidth, int destHeight, int srcPitch, uint32* bits) {}
 	virtual void			GetBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits) {}
+	// Raw float bits from a render target's depth buffer -- see DXTexture::GetDepthBits.
+	virtual void			GetDepthBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits) {}
+	// Wraps a render target's depth buffer as its own sampleable texture -- see DXTexture::CreateDepthRef.
+	virtual Texture*		CreateDepthRef() { return NULL; }
 
 	virtual void*			GetSharedHandle() { return NULL; }
 	virtual bool			AcquireKeyedMutex(uint64 key, uint32 timeoutMs) { return false; }
 	virtual void			ReleaseKeyedMutex(uint64 key) {}
+
+	// Resolves this MSAA render target into a matching-size single-sample target.
+	virtual void			ResolveTo(Texture* dest) {}
 };
 
 class TextureSegment
@@ -46,6 +53,7 @@ public:
 
 	virtual void			SetBits(int destX, int destY, int destWidth, int destHeight, int srcPitch, uint32* bits);
 	virtual void			GetBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits);
+	virtual void			GetDepthBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits);
 
 	void					GetImageData(ImageData& imageData);
 	void					GetImageData(ImageData& imageData, int destX, int destY);

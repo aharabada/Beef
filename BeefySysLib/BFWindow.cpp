@@ -153,6 +153,7 @@ BFWindow::BFWindow()
 	mMouseUpFunc = NULL;
 	mMouseWheelFunc = NULL;
 	mMouseLeaveFunc = NULL;
+	mRelativeMouseModeAbortedFunc = NULL;
 	mMenuItemSelectedFunc = NULL;
 	mDragDropFileFunc = NULL;
 	mHitTestFunc = NULL;
@@ -173,4 +174,9 @@ BFWindow::~BFWindow()
 {
 	delete mRenderWindow;
 	delete mMenu;
+}
+
+float BFWindow::GetMonitorRefreshRate()
+{
+	return (mRenderWindow != NULL) ? mRenderWindow->GetRefreshRate() : 0.0f;
 }

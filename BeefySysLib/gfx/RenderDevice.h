@@ -170,8 +170,10 @@ enum TextureFlag : int8
 	TextureFlag_Additive = 1,
 	TextureFlag_NoPremult = 2,
 	TextureFlag_AllowRead = 4,
-	TextureFlag_HasTransFollowing = 8,	
-	TextureFlag_Mipmaps = 0x10
+	TextureFlag_HasTransFollowing = 8,
+	TextureFlag_Mipmaps = 0x10,
+	// Color data: store sRGB-encoded, sample hardware-decoded to linear.
+	TextureFlag_Srgb = 0x20
 };
 
 struct VertexDefData
@@ -222,6 +224,7 @@ public:
 	Topology3D				mTopology;	
 	bool					mDisablePixelShader;
 	bool					mDisableRenderTarget;
+	bool					mDisableBlend;
 
 public:
 	RenderState();
@@ -239,6 +242,7 @@ public:
 	virtual void SetFrontFace(FrontFace frontFace) { mFrontFace = frontFace; }
 	virtual void SetDisablePixelShader(bool disable) { mDisablePixelShader = disable; }
 	virtual void SetDisableRenderTarget(bool disable) { mDisableRenderTarget = disable; }
+	virtual void SetDisableBlend(bool disable) { mDisableBlend = disable; }
 };
 
 class PoolData
@@ -298,6 +302,9 @@ public:
 	BFApp*					mApp;
 	RenderWindow*			mPhysRenderWindow;
 	RenderState*			mPhysRenderState;
+	// Sample count for window swapchains/backbuffers (blt-model MSAA, resolved by Present) -- must
+	// be set before window creation; validated against hardware support there.
+	int						mWindowMsaaSampleCount;
 	int						mResizeCount;
 	Array<RenderWindow*>	mRenderWindowList;
 	RenderTarget*			mCurRenderTarget;
@@ -333,7 +340,9 @@ public:
 	virtual Texture*		LoadTexture(ImageData* imageData, int flags) = 0;
 	virtual Texture*		CreateDynTexture(int width, int height) = 0;
 	virtual Texture*		LoadTexture(const StringImpl& fileName, int flags);
-	virtual Texture*		CreateRenderTarget(int width, int height, int flags) = 0;
+	virtual Texture*		CreateRenderTarget(int width, int height, int flags, int sampleCount) = 0;
+	// Depth-only target: no color plane; the depth buffer itself is the sampleable resource.
+	virtual Texture*		CreateDepthTarget(int width, int height, bool is16Bit) { return NULL; }
 	virtual Texture*		OpenSharedRenderTarget(void* handle, int width, int height) { return NULL; }
 	
 	virtual Shader*			LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition) = 0;

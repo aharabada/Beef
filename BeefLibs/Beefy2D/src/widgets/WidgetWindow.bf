@@ -26,6 +26,7 @@ namespace Beefy.widgets
         public Event<MouseLeftWindowHandler> mOnMouseLeftWindow ~ _.Dispose();
         public Event<WindowGotFocusHandler> mOnWindowGotFocus ~ _.Dispose();
 		public Event<WindowLostFocusHandler> mOnWindowLostFocus ~ _.Dispose();
+		public Event<delegate void(BFWindow window)> mOnRelativeMouseModeAborted ~ _.Dispose();
         public Event<MouseEventHandler> mOnMouseDown ~ _.Dispose();
 		public Event<MouseEventHandler> mOnMouseUp ~ _.Dispose();
         public Event<WindowCloseQueryHandler> mOnWindowCloseQuery ~ _.Dispose();
@@ -123,6 +124,7 @@ namespace Beefy.widgets
 	            mRootWidget.mWidgetWindow = this;
 	            mRootWidget.InitChildren();
 	            mRootWidget.AddedToParent();
+				mRootWidget.AddedToWindow();
 				RehupSize();
 			}
         }
@@ -703,6 +705,11 @@ namespace Beefy.widgets
         public override void MouseDelta(int32 dx, int32 dy)
         {
             mFocusWidget?.MouseDelta(dx, dy);
+        }
+
+        public override void RelativeMouseModeAborted()
+        {
+            mOnRelativeMouseModeAborted(this);
         }
 
         public override void MouseDown(int32 inX, int32 inY, int32 btn, int32 btnCount)

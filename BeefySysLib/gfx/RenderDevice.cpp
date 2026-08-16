@@ -28,6 +28,7 @@ RenderState::RenderState()
 	mWireframe = false;
 	mDisablePixelShader = false;
 	mDisableRenderTarget = false;
+	mDisableBlend = false;
 }
 
 RenderTarget::RenderTarget()
@@ -64,6 +65,7 @@ RenderDevice::RenderDevice() :
 	mCurRenderState = NULL;
 	mDefaultRenderState = NULL;
 	mPhysRenderState = mDefaultRenderState;
+	mWindowMsaaSampleCount = 1;
 	mResizeCount = 0;
 	mCurRenderTarget = NULL;
 	mCurDrawLayer = NULL;

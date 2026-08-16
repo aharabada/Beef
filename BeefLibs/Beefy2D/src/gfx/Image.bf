@@ -21,7 +21,9 @@ namespace Beefy.gfx
 			NoPremult = 2,
 			AllowRead = 4,
 			FatalError = 8,
-			Mipmaps = 0x10
+			Mipmaps = 0x10,
+			// Color data: stored sRGB-encoded, hardware-decoded to linear on sample.
+			Srgb = 0x20
 		}
 
 		public enum RenderTargetFlags
@@ -29,9 +31,13 @@ namespace Beefy.gfx
 			None,
 			Alpha = 1,
 			Shared = 2,
-			// Single-channel R32_FLOAT instead of RGBA8 -- for data render targets (eg shadow maps)
-			// that need real float precision rather than 8-bit-per-channel color storage.
-			HighPrecision = 4
+			// Single-channel R32_FLOAT instead of RGBA8 -- for data render targets that need real
+			// float precision rather than 8-bit-per-channel color storage.
+			HighPrecision = 4,
+			// Single-channel R8_UNORM -- for scalar masks (eg SSAO).
+			R8 = 8,
+			// RGBA16F -- for linear HDR scene color.
+			F16 = 16
 		}
 
         public Image mSrcTexture;
@@ -56,7 +62,19 @@ namespace Beefy.gfx
         static extern void* Gfx_CreateDynTexture(int32 width, int32 height);
 
         [CallingConvention(.Stdcall), CLink]
-        static extern void* Gfx_CreateRenderTarget(int32 width, int32 height, int32 destAlpha);
+        static extern void* Gfx_CreateRenderTarget(int32 width, int32 height, int32 flags, int32 sampleCount);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_CreateDepthTarget(int32 width, int32 height, int32 is16Bit);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_CreateDepthImageRef(void* textureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_ResolveTo(void* srcTextureSegment, void* destTextureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		public static extern void Gfx_SetWindowMsaaSamples(int32 sampleCount);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void* Gfx_RenderTarget_GetSharedHandle(void* textureSegment);
@@ -84,6 +102,9 @@ namespace Beefy.gfx
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void Gfx_Texture_GetBits(void* textureSegment, int32 srcX, int32 srcY, int32 srcWidth, int32 srcHeight, int32 destPitch, uint32* bits);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_GetDepthBits(void* textureSegment, int32 srcX, int32 srcY, int32 srcWidth, int32 srcHeight, int32 destPitch, uint32* bits);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void Gfx_Texture_Clear(void* textureSegment);
@@ -115,9 +136,12 @@ namespace Beefy.gfx
                 color, (int32)mPixelSnapping);            
         }
 
-		public static Image CreateRenderTarget(int32 width, int32 height, RenderTargetFlags flags)
+		// sampleCount > 1 makes an MSAA target: it can only be drawn into and ResolveTo'd -- never
+		// sampled/drawn as a texture or GetBits-read (resolve into a 1-sample target first). Falls
+		// back toward 1 if the hardware doesn't support the requested count.
+		public static Image CreateRenderTarget(int32 width, int32 height, RenderTargetFlags flags, int32 sampleCount = 1)
 		{
-		    void* aNativeTextureSegment = Gfx_CreateRenderTarget(width, height, (int32)flags);
+		    void* aNativeTextureSegment = Gfx_CreateRenderTarget(width, height, (int32)flags, sampleCount);
 		    if (aNativeTextureSegment == null)
 		        return null;
 
@@ -125,6 +149,36 @@ namespace Beefy.gfx
 		}
 
         public static Image CreateRenderTarget(int32 width, int32 height, bool destAlpha = false) => CreateRenderTarget(width, height, destAlpha ? .Alpha : .None);
+
+		// Wraps this render target's depth buffer as its own sampleable Image (R32_FLOAT). The caller
+		// owns the returned Image; the underlying resource is shared, so deletion order doesn't
+		// matter. 1-sample targets only.
+		public Image CreateDepthImage()
+		{
+			void* aNativeTextureSegment = Gfx_CreateDepthImageRef(mNativeTextureSegment);
+			if (aNativeTextureSegment == null)
+				return null;
+
+			return CreateFromNativeTextureSegment(aNativeTextureSegment);
+		}
+
+		// Depth-only target (no color plane): draw into it with a DisableRenderTarget +
+		// DisablePixelShader render state; sampling it samples the depth itself (incl. comparison
+		// samplers). GetDepthBits works, GetBits/ResolveTo do not. 1-sample only.
+		public static Image CreateDepthTarget(int32 width, int32 height, bool is16Bit)
+		{
+			void* aNativeTextureSegment = Gfx_CreateDepthTarget(width, height, is16Bit ? 1 : 0);
+			if (aNativeTextureSegment == null)
+				return null;
+
+			return CreateFromNativeTextureSegment(aNativeTextureSegment);
+		}
+
+		// Resolves this MSAA render target into a matching-size single-sample render target.
+		public void ResolveTo(Image dest)
+		{
+			Gfx_Texture_ResolveTo(mNativeTextureSegment, dest.mNativeTextureSegment);
+		}
         
 		public static Image OpenSharedRenderTarget(void* handle, int32 width, int32 height)
 		{
@@ -245,6 +299,12 @@ namespace Beefy.gfx
 			Gfx_Texture_GetBits(mNativeTextureSegment, (.)srcX, (.)srcY, (.)srcWidth, (.)srcHeight, (.)destPitch, bits);
 		}
 
+		// Raw float bits (NDC 0-1 depth) from a render target's depth buffer. 1-sample targets only.
+		public void GetDepthBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits)
+		{
+			Gfx_Texture_GetDepthBits(mNativeTextureSegment, (.)srcX, (.)srcY, (.)srcWidth, (.)srcHeight, (.)destPitch, bits);
+		}
+
         public void CreateImageCels(Image[,] celImages)
         {
 			int32 rows = (int32)celImages.GetLength(0);
@@ -307,6 +367,18 @@ namespace Beefy.gfx
 		public void MutexReleaseWrite()
 		{
 			Gfx_RenderTarget_KeyedMutex_Release(mNativeTextureSegment, 1);
+		}
+
+		// Plain try-lock usage of the keyed mutex: everyone acquires and releases with key 0, so the
+		// keys carry no reader/writer state -- "which buffer to use" must come from elsewhere.
+		public bool MutexTryAcquire()
+		{
+			return Gfx_RenderTarget_KeyedMutex_Acquire(mNativeTextureSegment, 0, 0);
+		}
+
+		public void MutexRelease()
+		{
+			Gfx_RenderTarget_KeyedMutex_Release(mNativeTextureSegment, 0);
 		}
 
 		public void Clear()

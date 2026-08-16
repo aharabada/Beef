@@ -207,6 +207,7 @@ WinBFWindow::WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y
 	mFlags = windowFlags;
 	mMouseVisible = true;
 	mRelativeMouseMode = false;
+	mRelativeMouseModeWanted = false;
 
 	mParent = parent;
 	HWND parentHWnd = NULL;
@@ -396,12 +397,16 @@ void WinBFWindow::Show(ShowKind showKind)
 void WinBFWindow::LostFocus(BFWindow* newFocus)
 {
 	///OutputDebugStrF("Lost focus\n");
-	// A hidden, clipped cursor left behind on an unfocused window would strand the user -- relative
-	// mode always ends on focus loss, regardless of why control is leaving (alt-tab, a modal dialog,
-	// clicking another app). Explicit re-entry (eg the IDE's Shift+F1 flow) goes through
-	// StartRelativeMouseMode again once focus is back.
+	// A hidden, clipped cursor left behind on an unfocused window would strand the user -- the OS
+	// taking control away (alt-tab, a modal dialog, clicking another app) always aborts relative
+	// mode. A full End, not a Suspend: whether to re-establish on refocus is the app's decision,
+	// made in response to this callback (re-calling StartRelativeMouseMode here is safe -- it
+	// defers via mRelativeMouseModeWanted until real focus is back).
 	if (mRelativeMouseMode)
+	{
 		EndRelativeMouseMode();
+		mRelativeMouseModeAbortedFunc(this);
+	}
 
 	mFocusLostTick = ::GetTickCount();
 	WinBFWindow* bfNewFocus = (WinBFWindow*)newFocus;
@@ -436,6 +441,8 @@ void WinBFWindow::GotFocus()
 		mAwaitKeyReleasesCheckIdx = 0;
 		mAwaitKeyReleasesEventTick = ::GetTickCount();
 	}
+
+	TryStartRelativeMouseModeIfWanted();
 }
 
 void WinBFWindow::SetForeground()
@@ -1359,6 +1366,7 @@ WinBFApp::WinBFApp()
 	mVSyncThreadId = 0;
 	mClosing = false;
 	mVSyncActive = false;
+	mExternalPacingEvent = NULL;
 	mVSyncThread = BfpThread_Create(VSyncThreadProcThunk, (void*)this, 128 * 1024, BfpThreadCreateFlag_StackSizeReserve, &mVSyncThreadId);
 	BfpThread_SetPriority(mVSyncThread, BfpThreadPriority_High, NULL);
 }
@@ -1440,9 +1448,36 @@ WinBFApp::~WinBFApp()
 	BfpThread_WaitFor(mVSyncThread, -1);
 	BfpThread_Release(mVSyncThread);
 
+	SetExternalPacing(NULL);
+
 	delete mRenderDevice;
 	delete mDSoundManager;
 	delete mDInputManager;
+}
+
+void WinBFApp::SetExternalPacing(const char* eventName)
+{
+	mExternalPacingActive = false;
+	if (mExternalPacingEvent != NULL)
+	{
+		::CloseHandle(mExternalPacingEvent);
+		mExternalPacingEvent = NULL;
+	}
+
+	if ((eventName == NULL) || (eventName[0] == 0))
+		return;
+
+	// Auto-reset; creation-order-independent (opens if the pacer already created it)
+	mExternalPacingEvent = ::CreateEventA(NULL, FALSE, FALSE, eventName);
+	if (mExternalPacingEvent != NULL)
+		mExternalPacingActive = true;
+}
+
+bool WinBFApp::WaitForExternalPacing(int timeoutMS)
+{
+	if (mExternalPacingEvent == NULL)
+		return false;
+	return ::WaitForSingleObject(mExternalPacingEvent, (DWORD)timeoutMS) == WAIT_OBJECT_0;
 }
 
 void WinBFApp::Init()
@@ -1866,7 +1901,18 @@ bool WinBFWindow::IsMouseCaptured()
 // RegisterRawInputDevices fails, leaving the window in its normal (non-relative) mouse mode.
 void WinBFWindow::StartRelativeMouseMode()
 {
+	mRelativeMouseModeWanted = true;
+
 	if (mRelativeMouseMode)
+		return;
+
+	// WM_INPUT delivery (and keyboard input, eg for Escape to release capture) requires this window to
+	// genuinely be the OS foreground window. Calling this before that's true -- eg the very first
+	// game-loop tick, right after window creation, racing ahead of the OS handing over real focus --
+	// would leave ClipCursor/ShowCursor below "succeeding" (they aren't focus-gated) while nothing is
+	// actually captured: cursor hidden, but no relative motion and no key events. Defer in that case;
+	// GotFocus retries via TryStartRelativeMouseModeIfWanted once we're genuinely foreground.
+	if (::GetForegroundWindow() != mHWnd)
 		return;
 
 	RAWINPUTDEVICE rid;
@@ -1896,6 +1942,7 @@ void WinBFWindow::StartRelativeMouseMode()
 
 void WinBFWindow::EndRelativeMouseMode()
 {
+	mRelativeMouseModeWanted = false;
 	if (!mRelativeMouseMode)
 		return;
 	mRelativeMouseMode = false;
@@ -1915,6 +1962,15 @@ void WinBFWindow::EndRelativeMouseMode()
 bool WinBFWindow::IsInRelativeMouseMode()
 {
 	return mRelativeMouseMode;
+}
+
+// Called on genuine focus-gain (WM_SETFOCUS or the WM_TIMER-based foreground poller, see WindowProc) --
+// retries StartRelativeMouseMode if something still wants relative mode but couldn't fully establish it
+// yet (see StartRelativeMouseMode's own foreground check).
+void WinBFWindow::TryStartRelativeMouseModeIfWanted()
+{
+	if ((mRelativeMouseModeWanted) && (!mRelativeMouseMode))
+		StartRelativeMouseMode();
 }
 
 int WinBFWindow::GetDPI()

@@ -5353,7 +5353,12 @@ void BfModule::CreateDelegateEqualsMethod()
 			continue;
 
 		if (fieldType->IsRef())
-			fieldType = CreatePointerType(fieldType->GetUnderlyingType());
+		{
+			auto underlyingType = fieldType->GetUnderlyingType();
+			if (underlyingType->IsVar())
+				underlyingType = GetPrimitiveType(BfTypeCode_None);
+			fieldType = CreatePointerType(underlyingType);
+		}
 
 		BfTypedValue leftValue = BfTypedValue(mBfIRBuilder->CreateInBoundsGEP(leftTypedVal.mValue, 0, fieldInstance->mDataIdx), fieldType, true);
 		BfTypedValue rightValue = BfTypedValue(mBfIRBuilder->CreateInBoundsGEP(rightTypedVal.mValue, 0, fieldInstance->mDataIdx), fieldType, true);
@@ -16708,6 +16713,8 @@ void BfModule::CheckVariableDef(BfLocalVariable* variableDef)
 		{
 			auto _Fail = [&](int warningNum, String str, BfAstNode* refNode)
 			{
+				if (refNode == NULL)
+					return;
 				BfError* error = Warn(warningNum, str, refNode);
 				if ((checkLocal->mNameNode != NULL) && (error != NULL))
 					mCompiler->mPassInstance->MoreInfo("Previous declaration", checkLocal->mNameNode);

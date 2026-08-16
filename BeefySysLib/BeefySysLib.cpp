@@ -224,6 +224,11 @@ BF_EXPORT void BF_CALLTYPE BFApp_SetRefreshRate(int rate)
 	gBFApp->mRefreshRate = (float) rate;
 }
 
+BF_EXPORT void BF_CALLTYPE BFApp_SetExternalPacing(const char* eventName)
+{
+	gBFApp->SetExternalPacing(eventName);
+}
+
 BF_EXPORT const char* BF_CALLTYPE BFApp_GetInstallDir()
 {
 	return gBFApp->mInstallDir.c_str();
@@ -313,7 +318,8 @@ BF_EXPORT void BF_CALLTYPE BFWindow_SetCallbacks(BFWindow* window, BFWindow_Move
 	BFWindow_KeyCharFunc keyCharFunc, BFWindow_KeyDownFunc keyDownFunc, BFWindow_KeyUpFunc keyUpFunc, BFWindow_HitTestFunc hitTestFunc,
 	BFWindow_MouseMove mouseMoveFunc, BFWindow_MouseProxyMove mouseProxyMoveFunc,
 	BFWindow_MouseDown mouseDownFunc, BFWindow_MouseUp mouseUpFunc, BFWindow_MouseWheel mouseWheelFunc, BFWindow_MouseLeave mouseLeaveFunc,
-	BFWindow_MenuItemSelectedFunc menuItemSelectedFunc, BFWindow_DragDropFileFunc dragDropFileFunc, BFWindow_MouseDelta mouseDeltaFunc)
+	BFWindow_MenuItemSelectedFunc menuItemSelectedFunc, BFWindow_DragDropFileFunc dragDropFileFunc, BFWindow_MouseDelta mouseDeltaFunc,
+	BFWindow_RelativeMouseModeAbortedFunc relativeMouseModeAbortedFunc)
 {
 	window->mMovedFunc = movedFunc;
 	window->mCloseQueryFunc = closeQueryFunc;
@@ -333,6 +339,7 @@ BF_EXPORT void BF_CALLTYPE BFWindow_SetCallbacks(BFWindow* window, BFWindow_Move
 	window->mMenuItemSelectedFunc = menuItemSelectedFunc;
 	window->mDragDropFileFunc = dragDropFileFunc;
 	window->mMouseDeltaFunc = mouseDeltaFunc;
+	window->mRelativeMouseModeAbortedFunc = relativeMouseModeAbortedFunc;
 }
 
 BF_EXPORT void* BFWindow_GetNativeUnderlying(BFWindow* window)
@@ -459,16 +466,55 @@ BF_EXPORT int BF_CALLTYPE BFWindow_GetDPI(BFWindow* window)
 	return window->GetDPI();
 }
 
+BF_EXPORT float BF_CALLTYPE BFWindow_GetMonitorRefreshRate(BFWindow* window)
+{
+	return window->GetMonitorRefreshRate();
+}
+
 ///
 
-BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateRenderTarget(int width, int height, int flags)
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateRenderTarget(int width, int height, int flags, int sampleCount)
 {
-	Texture* texture = gBFApp->mRenderDevice->CreateRenderTarget(width, height, flags);	
+	Texture* texture = gBFApp->mRenderDevice->CreateRenderTarget(width, height, flags, sampleCount);
 	texture->mResetClear = true;
 
 	TextureSegment* aTextureSegment = new TextureSegment();
-	aTextureSegment->InitFromTexture(texture);	
+	aTextureSegment->InitFromTexture(texture);
 	return aTextureSegment;
+}
+
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateDepthImageRef(TextureSegment* textureSegment)
+{
+	Texture* texture = textureSegment->mTexture->CreateDepthRef();
+	if (texture == NULL)
+		return NULL;
+
+	TextureSegment* aTextureSegment = new TextureSegment();
+	aTextureSegment->InitFromTexture(texture);
+	return aTextureSegment;
+}
+
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateDepthTarget(int width, int height, int is16Bit)
+{
+	Texture* texture = gBFApp->mRenderDevice->CreateDepthTarget(width, height, is16Bit != 0);
+	if (texture == NULL)
+		return NULL;
+	texture->mResetClear = true;
+
+	TextureSegment* aTextureSegment = new TextureSegment();
+	aTextureSegment->InitFromTexture(texture);
+	return aTextureSegment;
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Texture_ResolveTo(TextureSegment* srcSegment, TextureSegment* destSegment)
+{
+	srcSegment->mTexture->ResolveTo(destSegment->mTexture);
+}
+
+// Sample count for window swapchains -- must be called before window creation.
+BF_EXPORT void BF_CALLTYPE Gfx_SetWindowMsaaSamples(int sampleCount)
+{
+	gBFApp->mRenderDevice->mWindowMsaaSampleCount = sampleCount;
 }
 
 BF_EXPORT void* BF_CALLTYPE Gfx_RenderTarget_GetSharedHandle(TextureSegment* textureSegment)
@@ -526,6 +572,11 @@ BF_EXPORT void BF_CALLTYPE Gfx_Texture_SetBits(TextureSegment* textureSegment, i
 BF_EXPORT void BF_CALLTYPE Gfx_Texture_GetBits(TextureSegment* textureSegment, int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits)
 {
 	textureSegment->GetBits(srcX, srcY, srcWidth, srcHeight, destPitch, bits);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Texture_GetDepthBits(TextureSegment* textureSegment, int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits)
+{
+	textureSegment->GetDepthBits(srcX, srcY, srcWidth, srcHeight, destPitch, bits);
 }
 
 BF_EXPORT void BF_CALLTYPE Gfx_Texture_Clear(TextureSegment* textureSegment)
@@ -1012,6 +1063,11 @@ BF_EXPORT void BF_CALLTYPE RenderState_SetDisablePixelShader(RenderState* render
 BF_EXPORT void BF_CALLTYPE RenderState_SetDisableRenderTarget(RenderState* renderState, bool disable)
 {
 	renderState->SetDisableRenderTarget(disable);
+}
+
+BF_EXPORT void BF_CALLTYPE RenderState_SetDisableBlend(RenderState* renderState, bool disable)
+{
+	renderState->SetDisableBlend(disable);
 }
 
 BF_EXPORT Shader* BF_CALLTYPE Gfx_LoadShader(const char* fileName, VertexDefinition* vertexDefinition)

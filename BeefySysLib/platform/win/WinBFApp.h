@@ -56,6 +56,7 @@ public:
 	int						mMinHeight;
 	bool					mMouseVisible;
 	bool					mRelativeMouseMode;
+	bool					mRelativeMouseModeWanted; // Start was called but establishing deferred until we're genuinely foreground (see StartRelativeMouseMode)
 	POINT					mSavedCursorPos; // where the real cursor was when relative mode started
 	bool					mHasFocus;
 	bool					mSoftHasFocus; // Mostly tracks mHasFocus except for when we get an explicit 'LostFocus' callback
@@ -72,6 +73,7 @@ public:
 	void					RehupMouseOver(bool isMouseOver);
 	bool					CheckKeyReleases(bool isKeyDown);
 	void					GotFocus();
+	void					TryStartRelativeMouseModeIfWanted();
 
 public:
 	WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int64 windowFlags);
@@ -113,6 +115,7 @@ public:
 	DInputManager*			mDInputManager;
 	BfpThreadId				mVSyncThreadId;
 	BfpThread*				mVSyncThread;
+	HANDLE					mExternalPacingEvent;
 	volatile bool			mClosing;
 
 protected:
@@ -145,6 +148,9 @@ public:
 
 	virtual String			EnumerateInputDevices() override;
 	virtual BFInputDevice*	CreateInputDevice(const StringImpl& guid) override;
+
+	virtual void			SetExternalPacing(const char* eventName) override;
+	virtual bool			WaitForExternalPacing(int timeoutMS) override;
 
 	virtual BFSysBitmap*	LoadSysBitmap(const WCHAR* fileName) override;
 
