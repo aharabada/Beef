@@ -285,6 +285,8 @@ public:
 	void FixitAddFullyQualify(BfAstNode* refNode, const StringImpl& findName, const SizedArrayImpl<BfUsingFieldData::MemberRef>& foundList);
 	void FixitCheckPropertyBody(BfPropertyDeclaration* propertyDeclaration, BfTypeDef* typeDef);
 	void FixitCheckMethodBody(BfMethodDeclaration* methodDeclaration);
+	void FixitCheckIfStatement(BfIfStatement* ifStatement);
+	void FixitCheckSwitchStatement(BfSwitchStatement* switchStatement);
 	bool FixitGetCollapseReplace(BfParserData* parser, int anchorEnd, int blockStart, int deleteEnd, const StringImpl& insertText, StringImpl& outOps);
 
 	void AddResultTypeKind(BfType* type);

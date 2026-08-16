@@ -4913,6 +4913,277 @@ void BfAutoComplete::FixitCheckMethodBody(BfMethodDeclaration* methodDeclaration
 	}
 }
 
+// Detects an unlabeled `break` (or a `fallthrough`) that would rebind to a different target when
+//  the enclosing `if` becomes a `switch` or vice versa. Loops, `do` blocks, labeled blocks and
+//  nested switches capture their own breaks, so we don't descend into those
+static bool FixitStmtHasSwitchFlowControl(BfAstNode* stmt)
+{
+	if (stmt == NULL)
+		return false;
+	if (auto breakStmt = BfNodeDynCast<BfBreakStatement>(stmt))
+		return breakStmt->mLabel == NULL;
+	if (BfNodeIsA<BfFallthroughStatement>(stmt))
+		return true;
+	if (auto tokenNode = BfNodeDynCast<BfTokenNode>(stmt))
+		return (tokenNode->GetToken() == BfToken_Break) || (tokenNode->GetToken() == BfToken_Fallthrough);
+	if (auto block = BfNodeDynCast<BfBlock>(stmt))
+	{
+		int size = block->GetSize();
+		for (int i = 0; i < size; i++)
+		{
+			if (FixitStmtHasSwitchFlowControl((*block)[i]))
+				return true;
+		}
+		return false;
+	}
+	if (auto ifStmt = BfNodeDynCast<BfIfStatement>(stmt))
+		return (FixitStmtHasSwitchFlowControl(ifStmt->mTrueStatement)) || (FixitStmtHasSwitchFlowControl(ifStmt->mFalseStatement));
+	if (auto usingStmt = BfNodeDynCast<BfUsingStatement>(stmt))
+		return FixitStmtHasSwitchFlowControl(usingStmt->mEmbeddedStatement);
+	if (auto checkedStmt = BfNodeDynCast<BfCheckedStatement>(stmt))
+		return FixitStmtHasSwitchFlowControl(checkedStmt->mStatement);
+	if (auto uncheckedStmt = BfNodeDynCast<BfUncheckedStatement>(stmt))
+		return FixitStmtHasSwitchFlowControl(uncheckedStmt->mStatement);
+	if (auto attribStmt = BfNodeDynCast<BfAttributedStatement>(stmt))
+		return FixitStmtHasSwitchFlowControl(attribStmt->mStatement);
+	return false;
+}
+
+void BfAutoComplete::FixitCheckIfStatement(BfIfStatement* ifStatement)
+{
+	if ((ifStatement == NULL) || (ifStatement->mIfToken == NULL))
+		return;
+
+	bool doFixit = CheckFixit(ifStatement);
+	doFixit |= CheckFixit(ifStatement->mIfToken);
+	if (!doFixit)
+		return;
+
+	auto caseExpr = BfNodeDynCast<BfCaseExpression>(ifStatement->mCondition);
+	if (caseExpr == NULL)
+		return;
+	if ((caseExpr->mNotToken != NULL) || (caseExpr->mEqualsNode != NULL))
+		return;
+	if ((caseExpr->mValueExpression == NULL) || (caseExpr->mCaseToken == NULL) || (caseExpr->mCaseExpression == NULL))
+		return;
+	if (caseExpr->mValueExpression->GetSrcStart() >= caseExpr->mCaseToken->GetSrcStart())
+		return; // Legacy `case <pattern> = <value>` form
+
+	auto trueBlock = BfNodeDynCast<BfBlock>(ifStatement->mTrueStatement);
+	if ((trueBlock == NULL) || (trueBlock->mOpenBrace == NULL) || (trueBlock->mCloseBrace == NULL))
+		return;
+	// An unlabeled `break` in the body would rebind to the new `switch`
+	if (FixitStmtHasSwitchFlowControl(trueBlock))
+		return;
+
+	BfParserData* parser = ifStatement->GetSourceData()->ToParserData();
+	if (parser == NULL)
+		return;
+
+	// A plain `else` block becomes the `default` case; `else if` and braceless bodies don't convert
+	BfBlock* falseBlock = NULL;
+	if (ifStatement->mElseToken != NULL)
+	{
+		falseBlock = BfNodeDynCast<BfBlock>(ifStatement->mFalseStatement);
+		if ((falseBlock == NULL) || (falseBlock->mOpenBrace == NULL) || (falseBlock->mCloseBrace == NULL))
+			return;
+		if (FixitStmtHasSwitchFlowControl(falseBlock))
+			return;
+		if ((!FixitIsWhitespaceSpan(parser, trueBlock->mCloseBrace->GetSrcEnd(), ifStatement->mElseToken->GetSrcStart())) ||
+			(!FixitIsWhitespaceSpan(parser, ifStatement->mElseToken->GetSrcEnd(), falseBlock->mOpenBrace->GetSrcStart())))
+			return;
+	}
+	else if (ifStatement->mFalseStatement != NULL)
+		return;
+
+	// The spans we delete inside the parens must not hold comments
+	if ((!FixitIsWhitespaceSpan(parser, caseExpr->mValueExpression->GetSrcEnd(), caseExpr->mCaseToken->GetSrcStart())) ||
+		(!FixitIsWhitespaceSpan(parser, caseExpr->mCaseToken->GetSrcEnd(), caseExpr->mCaseExpression->GetSrcStart())))
+		return;
+
+	String patternStr;
+	if (!FixitEncodeSourceText(parser, caseExpr->mCaseExpression->GetSrcStart(), caseExpr->mCaseExpression->GetSrcEnd(), patternStr))
+		return;
+	if (patternStr.Contains('\r'))
+		return; // Multi-line pattern
+
+	// Ops in descending file position: [`} else {` -> `default:`], insert the case label after the `{`,
+	//  remove ` case <pattern>` from the condition, replace `if` with `switch`
+	String ops;
+	if (falseBlock != NULL)
+	{
+		ops += StrFormat(".reformat|%s-%d|default:\x01",
+			FixitGetLocation(parser, trueBlock->mCloseBrace->GetSrcStart()).c_str(),
+			falseBlock->mOpenBrace->GetSrcEnd() - trueBlock->mCloseBrace->GetSrcStart());
+	}
+
+	if (FixitGetLineEndAfter(parser, trueBlock->mOpenBrace->GetSrcEnd()) != -1)
+	{
+		// The body starts on the next line: paste the case label as a fresh line below the `{`
+		//  (the leading-newline paste path matches indentation and un-indents `case` lines)
+		int insertPos = BfFixitFinder::FindLineStartAfter(trueBlock->mOpenBrace);
+		ops += StrFormat("reformat|%s|%d||case %s:", parser->mFileName.c_str(), insertPos, patternStr.c_str());
+	}
+	else
+	{
+		// Single-line body: `{ <stmts> }` becomes `{ case <pattern>: <stmts> }`
+		ops += StrFormat("reformat|%s|%d| case %s:", parser->mFileName.c_str(), trueBlock->mOpenBrace->GetSrcEnd(), patternStr.c_str());
+	}
+
+	int caseDeleteStart = caseExpr->mValueExpression->GetSrcEnd();
+	ops += StrFormat("\x01" ".delete|%s-%d|", FixitGetLocation(parser, caseDeleteStart).c_str(),
+		caseExpr->mCaseExpression->GetSrcEnd() - caseDeleteStart);
+
+	ops += StrFormat("\x01" ".reformat|%s-%d|switch", FixitGetLocation(parser, ifStatement->mIfToken->GetSrcStart()).c_str(),
+		ifStatement->mIfToken->GetSrcEnd() - ifStatement->mIfToken->GetSrcStart());
+
+	AddEntry(AutoCompleteEntry("fixit", ("Convert 'if' to 'switch'\t" + ops).c_str()));
+}
+
+void BfAutoComplete::FixitCheckSwitchStatement(BfSwitchStatement* switchStatement)
+{
+	if (switchStatement == NULL)
+		return;
+	if ((switchStatement->mSwitchToken == NULL) || (switchStatement->mOpenParen == NULL) || (switchStatement->mSwitchValue == NULL) ||
+		(switchStatement->mCloseParen == NULL) || (switchStatement->mOpenBrace == NULL) || (switchStatement->mCloseBrace == NULL))
+		return;
+	if (switchStatement->mSwitchCases.mSize != 1)
+		return;
+
+	auto switchCase = switchStatement->mSwitchCases[0];
+	auto defaultCase = switchStatement->mDefaultCase;
+
+	bool doFixit = CheckFixit(switchStatement);
+	doFixit |= CheckFixit(switchStatement->mSwitchToken);
+	doFixit |= CheckFixit(switchCase);
+	if (defaultCase != NULL)
+		doFixit |= CheckFixit(defaultCase);
+	if (!doFixit)
+		return;
+
+	if ((switchCase->mCaseToken == NULL) || (switchCase->mColonToken == NULL))
+		return;
+	if ((switchCase->mCaseExpressions.mSize != 1) || (switchCase->mCaseCommas.mSize != 0))
+		return;
+	auto patternExpr = switchCase->mCaseExpressions[0];
+	if (BfNodeIsA<BfWhenExpression>(patternExpr))
+		return;
+	if (switchCase->mEndingToken != NULL)
+		return; // Trailing `break` / `fallthrough`
+	// An unlabeled `break` in the body would lose its target in an `if`
+	if (FixitStmtHasSwitchFlowControl(switchCase->mCodeBlock))
+		return;
+
+	BfParserData* parser = switchStatement->GetSourceData()->ToParserData();
+	if (parser == NULL)
+		return;
+
+	// The spans we delete must not hold comments
+	if ((!FixitIsWhitespaceSpan(parser, switchCase->mCaseToken->GetSrcEnd(), patternExpr->GetSrcStart())) ||
+		(!FixitIsWhitespaceSpan(parser, patternExpr->GetSrcEnd(), switchCase->mColonToken->GetSrcStart())))
+		return;
+
+	String patternStr;
+	if (!FixitEncodeSourceText(parser, patternExpr->GetSrcStart(), patternExpr->GetSrcEnd(), patternStr))
+		return;
+	if (patternStr.Contains('\r'))
+		return; // Multi-line pattern
+
+	// A trailing `default` case can become the `else`: `default:` turns into `}` + `else` and the
+	//  switch's own closing `}` gets removed. The `else` is emitted braceless so the body keeps its
+	//  indentation, which limits this to single-statement default bodies
+	String defaultOps;
+	if (defaultCase != NULL)
+	{
+		if ((defaultCase->mCaseToken == NULL) || (defaultCase->mColonToken == NULL))
+			return;
+		if (defaultCase->mEndingToken != NULL)
+			return;
+		auto defaultBlock = defaultCase->mCodeBlock;
+		if ((defaultBlock == NULL) || (defaultBlock->GetSize() != 1))
+			return;
+		BfAstNode* defaultStmt = (*defaultBlock)[0];
+		// These can't stand as a braceless embedded statement (or would change their scoping)
+		if ((BfNodeIsA<BfVariableDeclaration>(defaultStmt)) || (BfNodeIsA<BfLocalMethodDeclaration>(defaultStmt)) ||
+			(BfNodeIsA<BfDeferStatement>(defaultStmt)))
+			return;
+		if (FixitStmtHasSwitchFlowControl(defaultBlock))
+			return;
+
+		// `default` must start its line
+		int defaultLineStart = BfFixitFinder::FindLineStartBefore(defaultCase->mCaseToken);
+		if (!FixitIsWhitespaceSpan(parser, defaultLineStart, defaultCase->mCaseToken->GetSrcStart()))
+			return;
+
+		// The switch's closing `}` must sit alone on its line so we can remove the whole line
+		int closeLineStart = BfFixitFinder::FindLineStartBefore(switchStatement->mCloseBrace);
+		if (!FixitIsWhitespaceSpan(parser, closeLineStart, switchStatement->mCloseBrace->GetSrcStart()))
+			return;
+		int closeDeleteEnd = switchStatement->mCloseBrace->GetSrcEnd();
+		while ((closeDeleteEnd < parser->mSrcLength) && ((parser->mSrc[closeDeleteEnd] == ' ') || (parser->mSrc[closeDeleteEnd] == '\t')))
+			closeDeleteEnd++;
+		if (closeDeleteEnd < parser->mSrcLength)
+		{
+			if ((parser->mSrc[closeDeleteEnd] != '\n') && (parser->mSrc[closeDeleteEnd] != '\r'))
+				return;
+			if (parser->mSrc[closeDeleteEnd] == '\r')
+				closeDeleteEnd++;
+			if ((closeDeleteEnd < parser->mSrcLength) && (parser->mSrc[closeDeleteEnd] == '\n'))
+				closeDeleteEnd++;
+		}
+
+		int defaultDeleteStart = defaultCase->mCaseToken->GetSrcStart();
+		int defaultDeleteEnd = defaultCase->mColonToken->GetSrcEnd();
+		int scanIdx = defaultDeleteEnd;
+		while ((scanIdx < parser->mSrcLength) && ((parser->mSrc[scanIdx] == ' ') || (parser->mSrc[scanIdx] == '\t')))
+			scanIdx++;
+		bool cleanLineEnd = (scanIdx >= parser->mSrcLength) || (parser->mSrc[scanIdx] == '\n') || (parser->mSrc[scanIdx] == '\r');
+
+		defaultOps += StrFormat(".delete|%s-%d|", FixitGetLocation(parser, closeLineStart).c_str(), closeDeleteEnd - closeLineStart);
+		if (cleanLineEnd)
+		{
+			// The `\r` newline lands the `else` at the `}` line's indent level
+			defaultOps += StrFormat("\x01" ".reformat|%s-%d|}\relse", FixitGetLocation(parser, defaultDeleteStart).c_str(), scanIdx - defaultDeleteStart);
+		}
+		else
+		{
+			// A statement or comment follows on the line: keep it in place behind `} else`
+			defaultOps += StrFormat("\x01" ".reformat|%s-%d|} else", FixitGetLocation(parser, defaultDeleteStart).c_str(), defaultDeleteEnd - defaultDeleteStart);
+		}
+		defaultOps += "\x01";
+	}
+
+	// If the case label sits alone on its line we remove the whole line, otherwise just `case <pattern>: `
+	int deleteStart = switchCase->mCaseToken->GetSrcStart();
+	int deleteEnd = switchCase->mColonToken->GetSrcEnd();
+	while ((deleteEnd < parser->mSrcLength) && ((parser->mSrc[deleteEnd] == ' ') || (parser->mSrc[deleteEnd] == '\t')))
+		deleteEnd++;
+	int lineStart = BfFixitFinder::FindLineStartBefore(switchCase->mCaseToken);
+	if ((deleteEnd < parser->mSrcLength) && ((parser->mSrc[deleteEnd] == '\n') || (parser->mSrc[deleteEnd] == '\r')) &&
+		(FixitIsWhitespaceSpan(parser, lineStart, deleteStart)))
+	{
+		deleteStart = lineStart;
+		if (parser->mSrc[deleteEnd] == '\r')
+			deleteEnd++;
+		if ((deleteEnd < parser->mSrcLength) && (parser->mSrc[deleteEnd] == '\n'))
+			deleteEnd++;
+	}
+
+	// Ops in descending file position: [remove the switch's `}` line, `default:` -> `}` + `else`],
+	//  remove the case label, insert ` case <pattern>` into the parens, replace `switch` with `if`.
+	//  The braces already work as the `if` body
+	String ops = defaultOps;
+	ops += StrFormat(".delete|%s-%d|", FixitGetLocation(parser, deleteStart).c_str(), deleteEnd - deleteStart);
+
+	ops += StrFormat("\x01" "reformat|%s|%d| case %s", parser->mFileName.c_str(),
+		switchStatement->mCloseParen->GetSrcStart(), patternStr.c_str());
+
+	ops += StrFormat("\x01" ".reformat|%s-%d|if", FixitGetLocation(parser, switchStatement->mSwitchToken->GetSrcStart()).c_str(),
+		switchStatement->mSwitchToken->GetSrcEnd() - switchStatement->mSwitchToken->GetSrcStart());
+
+	AddEntry(AutoCompleteEntry("fixit", ("Convert 'switch' to 'if'\t" + ops).c_str()));
+}
+
 String BfAutoComplete::ConstantToString(BfIRConstHolder* constHolder, BfTypedValue typedValue)
 {
 	SetAndRestoreValue<BfTypeInstance*> prevTypeInst(mModule->mCurTypeInstance, typedValue.mType->ToTypeInstance());

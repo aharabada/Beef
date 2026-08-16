@@ -3911,7 +3911,10 @@ void BfModule::DoIfStatement(BfIfStatement* ifStmt, bool includeTrueStmt, bool i
 {
 	auto autoComplete = mCompiler->GetAutoComplete();
 	if (autoComplete != NULL)
+	{
 		autoComplete->CheckIdentifier(ifStmt->mIfToken, true);
+		autoComplete->FixitCheckIfStatement(ifStmt);
+	}
 
 	if (ifStmt->mCondition == NULL)
 	{
@@ -4509,7 +4512,10 @@ void BfModule::Visit(BfDeleteStatement* deleteStmt)
 }
 
 void BfModule::Visit(BfSwitchStatement* switchStmt)
-{	
+{
+	if (auto autoComplete = mCompiler->GetAutoComplete())
+		autoComplete->FixitCheckSwitchStatement(switchStmt);
+
 	BfScopeData outerScope;
 	outerScope.mInnerIsConditional = false;
 	outerScope.mCloseNode = switchStmt;
