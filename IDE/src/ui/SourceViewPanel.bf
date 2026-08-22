@@ -2877,10 +2877,11 @@ namespace IDE.ui
 				EditGotFocus();
         }
 
-		public override void Activate()
+		public override void Activate(ActivateKind activateKind)
 		{
-			base.Activate();
-			FocusEdit();
+			base.Activate(activateKind);
+			if (activateKind >= .Active)
+				FocusEdit();
 		}
 
         public override void SetFocus()
@@ -2897,7 +2898,7 @@ namespace IDE.ui
 					return true;
 				if ((mSplitBottomPanel != null) && (mSplitBottomPanel.mEditWidget.mHasFocus))
 					return true;
-				if ((mOldVersionPanel != null) && (mOldVersionPanel?.mEditWidget.mHasFocus == true))
+				if ((mOldVersionPanel != null) && (mOldVersionPanel?.mEditWidget?.mHasFocus == true))
 					return true;
 			}
 			if (mEditWidget.mHasFocus)

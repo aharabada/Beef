@@ -2150,7 +2150,7 @@ namespace IDE
 			}
 		}
 
-		bool SaveWorkspaceUserData(bool showErrors = true)
+		protected virtual bool SaveWorkspaceUserData(bool showErrors = true)
 		{
 			// Don't save if we didn't finish creating the workspace
 			if (mWorkspace.mNeedsCreate)
@@ -3876,7 +3876,7 @@ namespace IDE
 		}
 
 		[IDECommand]
-		public void SaveFile()
+		public virtual void SaveFile()
 		{
 			var sourceViewPanel = GetActiveSourceViewPanel();
 			if (sourceViewPanel != null)
@@ -6555,7 +6555,7 @@ namespace IDE
 				IDECommand ideCommand = null;
 				if (childInfo.mCmdName != null)
 				{
-					ideCommand = mCommands.mCommandMap[childInfo.mCmdName];
+					ideCommand = mCommands.mCommandMap.GetValue(childInfo.mCmdName).GetValueOrDefault();
 					if (ideCommand != null)
 					{
 						keyStr.Clear();
@@ -6819,7 +6819,7 @@ namespace IDE
 				if (activeTab != null)
 				{
 					var lastActivePanel = activeTab.mContent;
-					if ((lastActivePanel is SourceViewPanel) || (lastActivePanel is DisassemblyPanel) || (activePanel is ContentPanel))
+					if ((lastActivePanel is SourceViewPanel) || (lastActivePanel is DisassemblyPanel) || (lastActivePanel is ContentPanel))
 						return lastActivePanel;
 				}
 			}
@@ -6995,6 +6995,9 @@ namespace IDE
 						mTabbedView.mHasFillWidget = true;
 					}
 				}
+
+				if (var panel = mContent as Panel)
+					panel.Activate(setFocus ? .Active : .Passive);
 			}
 
 			public override void Draw(Graphics g)
@@ -7414,7 +7417,7 @@ namespace IDE
 			return (panel as SourceViewPanel, tabButton);
 		}
 
-		protected virtual Result<ContentPanel> CreateContentPanel(StringView useFilePath, SourceShowType showType)
+		protected virtual Result<ContentPanel> CreateContentPanel(StringView useFilePath, ProjectSource projectSource, SourceShowType showType)
 		{
 			if (!useFilePath.IsEmpty)
 			{
@@ -7543,7 +7546,7 @@ namespace IDE
 					contentPanelTab.mTabbedView.FinishTabAnim();
 					if (setFocus)
 					{
-						contentPanel.Activate();
+						contentPanel.Activate(.Explicit);
 					}
 
 					if (var sourceViewPanel = contentPanel as SourceViewPanel)
@@ -7560,7 +7563,7 @@ namespace IDE
 			ActivateWindow(tabbedView.mWidgetWindow);
 
 			///
-			switch (CreateContentPanel(useFilePath, showType))
+			switch (CreateContentPanel(useFilePath, projectSource, showType))
 			{
 			case .Ok(out contentPanel):
 				if (contentPanel == null)
@@ -7590,6 +7593,9 @@ namespace IDE
 				}
 				contentPanel = sourceViewPanel;
 			}
+
+			if ((contentPanel != null) && (projectSource != null) && (contentPanel.mProjectSource != projectSource))
+				contentPanel.AttachToProjectSource(projectSource);
 
 			var newTabButton = new ContentTabButton();
 			newTabButton.Label = "";
@@ -8080,7 +8086,7 @@ namespace IDE
 				CloseDocument(sourceViewPanel);
 		}
 
-		public SourceViewPanel ShowProjectItem(ProjectItem projectItem, bool showTemp = true, bool setFocus = true)
+		public virtual SourceViewPanel ShowProjectItem(ProjectItem projectItem, bool showTemp = true, bool setFocus = true)
 		{
 			if (projectItem is ProjectSource)
 			{
@@ -15298,7 +15304,7 @@ namespace IDE
 			}
 		}
 
-		public void OnWatchedFileChanged(ProjectItem projectItem, WatcherChangeTypes changeType, String newPath)
+		public virtual void OnWatchedFileChanged(ProjectItem projectItem, WatcherChangeTypes changeType, String newPath)
 		{
 			CompilerLog("IDEApp.OnWatchedFileChanged {} {} {}", projectItem.mName, changeType, newPath);
 
@@ -15345,7 +15351,7 @@ namespace IDE
 			else if (changeType == .FileCreated)
 			{
 				let projectFolder = projectItem as ProjectFolder;
-				if (projectFolder.IsAutoInclude())
+				if ((projectFolder.IsAutoInclude()) && (projectFolder.CheckAddFile(newPath)))
 				{
 					if (!projectFolder.mChildMap.ContainsKey(newName))
 					{

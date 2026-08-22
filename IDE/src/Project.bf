@@ -550,6 +550,11 @@ namespace IDE
 			return mAutoInclude;
 		}
 
+		public virtual bool CheckAddFile(StringView path)
+		{
+			return true;
+		}
+
         public virtual void AddChildAtIndex(int index, ProjectItem item)
         {
 			item.mParentFolder = this;
@@ -705,6 +710,11 @@ namespace IDE
 			return projectItem;
 		}
 
+		public virtual ProjectItem CreateProjectSource(StringView type, StructuredData data)
+		{
+			return new ProjectSource();
+		}
+
         public override void Deserialize(StructuredData data)
         {
             base.Deserialize(data);
@@ -794,7 +804,7 @@ namespace IDE
 				String fileName = scope String();
 				fileEntry.GetFileName(fileName);
 
-				if ((!gApp.IsFilteredOut(fileName)) && (!mChildMap.ContainsKey(fileName)))
+				if ((!gApp.IsFilteredOut(fileName)) && (!mChildMap.ContainsKey(fileName)) && (CheckAddFile(fileName)))
 				{
 					let projectItem = new ProjectSource();
 					projectItem.mProject = mProject;

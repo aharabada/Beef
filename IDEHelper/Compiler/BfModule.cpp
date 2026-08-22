@@ -1073,6 +1073,7 @@ void BfModule::Init(bool isFullRebuild)
 	mFuncReferences.Clear();
 	mClassVDataRefs.Clear();
 	mClassVDataExtRefs.Clear();
+	mDevirtThunkRefs.Clear();
 	//mTypeDataRefs.Clear();
 	mDbgRawAllocDataRefs.Clear();
 	CleanupFileInstances();
@@ -1495,6 +1496,7 @@ void BfModule::StartExtension()
 	mFuncReferences.Clear();
 	mClassVDataRefs.Clear();
 	mClassVDataExtRefs.Clear();
+	mDevirtThunkRefs.Clear();
 	for (auto& kv : mTypeDataRefs)
 		kv.mValue = BfIRValue();
 	mDbgRawAllocDataRefs.Clear();
@@ -5873,6 +5875,340 @@ BfIRValue BfModule::CreateClassVDataExtGlobal(BfTypeInstance* declTypeInst, BfTy
 	return globalVariable;
 }
 
+// Rewrites 'typeInstance's vtable so each slot holds the implementation visible from mProject - an
+//  extension's project isn't necessarily referenced by every executable using the extended type.
+//  Returns the original vtable for the caller to restore; empty means no reslotting was needed.
+Array<BfVirtualMethodEntry> BfModule::ReslotVTableForProject(BfTypeInstance* typeInstance)
+{
+	Array<BfVirtualMethodEntry> origVTable;
+
+	// Only combined partials can have extension overrides
+	if (!typeInstance->mTypeDef->mIsCombinedPartial)
+		return origVTable;
+
+	HashSet<String> reslotNames;
+	for (int virtIdx = 0; virtIdx < (int)typeInstance->mVirtualMethodTable.size(); virtIdx++)
+	{
+		auto& entry = typeInstance->mVirtualMethodTable[virtIdx];
+		if (entry.mDeclaringMethod.mMethodNum == -1)
+			continue;
+		BfMethodInstance* methodInstance = (BfMethodInstance*)entry.mImplementingMethod;
+		if ((methodInstance == NULL) ||
+			((!mIsComptimeModule) && (!typeInstance->IsTypeMemberAccessible(methodInstance->mMethodDef->mDeclaringType, mProject))))
+		{
+			if (origVTable.empty())
+				origVTable = typeInstance->mVirtualMethodTable;
+
+			BfMethodInstance* declMethodInstance = entry.mDeclaringMethod;
+			if (declMethodInstance != NULL)
+			{
+				if ((mIsComptimeModule) || (typeInstance->IsTypeMemberAccessible(declMethodInstance->mMethodDef->mDeclaringType, mProject)))
+				{
+					// Prepare to reslot...
+					entry.mImplementingMethod = entry.mDeclaringMethod;
+					reslotNames.Add(declMethodInstance->mMethodDef->mName);
+				}
+				else
+				{
+					// Decl isn't accessible, null out entry
+					entry.mImplementingMethod = BfMethodRef();
+				}
+			}
+		}
+	}
+
+	if (!reslotNames.IsEmpty())
+	{
+		BfAmbiguityContext ambiguityContext;
+		ambiguityContext.mTypeInstance = typeInstance;
+		ambiguityContext.mModule = this;
+		ambiguityContext.mIsProjectSpecific = true;
+		ambiguityContext.mIsReslotting = true;
+
+		SetAndRestoreValue<BfTypeInstance*> prevTypeInstance(mCurTypeInstance, typeInstance);
+		for (auto& methodGroup : typeInstance->mMethodInstanceGroups)
+		{
+			auto methodInstance = methodGroup.mDefault;
+			if ((methodInstance == NULL) || (!methodInstance->mMethodDef->mIsOverride))
+				continue;
+
+			if (!reslotNames.Contains(methodInstance->mMethodDef->mName))
+				continue;
+
+			if ((!mIsComptimeModule) && (!typeInstance->IsTypeMemberAccessible(methodInstance->mMethodDef->mDeclaringType, mProject)))
+				continue;
+			if ((methodInstance->mChainType != BfMethodChainType_None) && (methodInstance->mChainType != BfMethodChainType_ChainHead))
+				continue;
+			SlotVirtualMethod(methodInstance, &ambiguityContext);
+		}
+
+		ambiguityContext.Finish();
+	}
+
+	return origVTable;
+}
+
+// Whether this slot's implementation can differ between executables. Evaluate against the
+//  full-visibility (un-reslotted) vtable.
+// Deliberately project-independent: a call site may skip a thunk it would otherwise reference, but
+//  emission must not, since another project can still need this slot's thunk.
+bool BfModule::VirtualSlotNeedsDevirtThunk(BfTypeInstance* typeInstance, int virtIdx)
+{
+	if (!typeInstance->mTypeDef->mIsCombinedPartial)
+		return false;
+	if ((virtIdx < 0) || (virtIdx >= (int)typeInstance->mVirtualMethodTable.mSize))
+		return false;
+
+	auto& entry = typeInstance->mVirtualMethodTable[virtIdx];
+	if (entry.mDeclaringMethod.mMethodNum == -1)
+		return false; // vExt marker slot, not a real method reference
+
+	BfMethodInstance* implMethodInstance = (BfMethodInstance*)entry.mImplementingMethod;
+	if ((implMethodInstance == NULL) || (entry.mDeclaringMethod.IsNull()))
+		return false;
+
+	// Non-extension declarations are visible wherever 'typeInstance' is, so a non-extension winner
+	//  wins everywhere - only an extension override can win in one executable and lose in another.
+	return implMethodInstance->mMethodDef->mDeclaringType->IsExtension();
+}
+
+void BfModule::GetDevirtThunkName(StringImpl& name, BfTypeInstance* typeInstance, BfMethodInstance* declaringMethodInstance)
+{
+	BfMangler::MangleStaticFieldName(name, mCompiler->GetMangleKind(), typeInstance, "bf_dvt");
+	name += "$";
+	BfMangler::Mangle(name, mCompiler->GetMangleKind(), declaringMethodInstance);
+}
+
+// Returns a thunk to call instead of binding 'methodInstance' directly, for when a type extension
+//  could make this devirtualized call resolve differently per executable. The thunk body is emitted
+//  in each executable's vdata. Empty result means the direct call is already unambiguous.
+BfIRValue BfModule::TryGetDevirtThunk(BfTypeInstance* typeInstance, BfMethodInstance* methodInstance)
+{
+	if ((mIsComptimeModule) || (mBfIRBuilder->mIgnoreWrites) || (mCompiler->mIsResolveOnly))
+		return BfIRValue();
+	if ((typeInstance == NULL) || (methodInstance == NULL))
+		return BfIRValue();
+	if ((!typeInstance->IsObject()) || (typeInstance->IsInterface()))
+		return BfIRValue();
+	if (methodInstance->mVirtualTableIdx < 0)
+		return BfIRValue();
+	if (methodInstance->GetOwner()->IsUnspecializedType())
+		return BfIRValue();
+
+	// A 'base' call inside an override of this slot means "the declaration I override", not
+	//  "what this slot resolves to" - redirecting it would make the override call itself forever.
+	if (mCurTypeInstance == typeInstance)
+		return BfIRValue();
+
+	PopulateType(typeInstance, BfPopulateType_DataAndMethods);
+	if (!VirtualSlotNeedsDevirtThunk(typeInstance, methodInstance->mVirtualTableIdx))
+		return BfIRValue();
+
+	auto& entry = typeInstance->mVirtualMethodTable[methodInstance->mVirtualTableIdx];
+
+	// Already the full-visibility winner, so every executable agrees with us: linking our module
+	//  requires depending on our project, so their visible set is a superset of ours. Emission must
+	//  not apply this relaxation - see VirtualSlotNeedsDevirtThunk.
+	if ((BfMethodInstance*)entry.mImplementingMethod == methodInstance)
+		return BfIRValue();
+
+	BfMethodInstance* declaringMethodInstance = (BfMethodInstance*)entry.mDeclaringMethod;
+	if (declaringMethodInstance == NULL)
+		return BfIRValue();
+
+	BfDevirtThunkEntry mapEntry;
+	mapEntry.mTypeInstance = typeInstance;
+	mapEntry.mDeclaringMethod = entry.mDeclaringMethod;
+
+	BfIRValue* irValuePtr = NULL;
+	if (mDevirtThunkRefs.TryGetValue(mapEntry, &irValuePtr))
+		return *irValuePtr;
+
+	StringT<512> thunkName;
+	GetDevirtThunkName(thunkName, typeInstance, declaringMethodInstance);
+
+	BfLogSysM("Referencing devirt thunk %s\n", thunkName.c_str());
+
+	auto thunkFuncType = mBfIRBuilder->MapMethod(declaringMethodInstance);
+	auto thunkFunc = mBfIRBuilder->CreateFunction(thunkFuncType, BfIRLinkageType_External, thunkName);
+	mDevirtThunkRefs[mapEntry] = thunkFunc;
+	return thunkFunc;
+}
+
+// Emits thunk bodies for 'typeInstance', resolved against this vdata's project. Over-emitting is
+//  harmless; any module referencing a thunk forces 'typeInstance' reified wherever it links.
+void BfModule::CreateDevirtThunks(BfTypeInstance* typeInstance)
+{
+	if ((mIsComptimeModule) || (mBfIRBuilder->mIgnoreWrites))
+		return;
+	if ((!typeInstance->IsObject()) || (typeInstance->IsInterface()))
+		return;
+	if (typeInstance->IsUnspecializedType())
+		return;
+	if (typeInstance->mVirtualMethodTableSize == 0)
+		return;
+	if (!typeInstance->mTypeDef->mIsCombinedPartial)
+		return;
+
+	// Collect against the full-visibility table, matching the call-site predicate
+	SizedArray<int, 8> thunkSlots;
+	for (int virtIdx = 0; virtIdx < (int)typeInstance->mVirtualMethodTable.mSize; virtIdx++)
+	{
+		if (VirtualSlotNeedsDevirtThunk(typeInstance, virtIdx))
+			thunkSlots.push_back(virtIdx);
+	}
+	if (thunkSlots.IsEmpty())
+		return;
+
+	SizedArray<BfMethodInstance*, 8> declaringMethods;
+	for (int virtIdx : thunkSlots)
+		declaringMethods.push_back((BfMethodInstance*)typeInstance->mVirtualMethodTable[virtIdx].mDeclaringMethod);
+
+	// Resolve exactly as the vtable does, so 'base' calls and virtual dispatch can't disagree
+	Array<BfVirtualMethodEntry> origVTable = ReslotVTableForProject(typeInstance);
+
+	for (int slotIdx = 0; slotIdx < (int)thunkSlots.size(); slotIdx++)
+	{
+		int virtIdx = thunkSlots[slotIdx];
+		BfMethodInstance* declaringMethodInstance = declaringMethods[slotIdx];
+		if (declaringMethodInstance == NULL)
+			continue;
+
+		BfMethodInstance* implMethodInstance = (BfMethodInstance*)typeInstance->mVirtualMethodTable[virtIdx].mImplementingMethod;
+
+		if ((implMethodInstance != NULL) && (implMethodInstance->mMethodDef->mIsAbstract))
+		{
+			// Only the abstract declaration is visible here, so there is nothing to bind to
+			mCompiler->mPassInstance->Fail(StrFormat("Project '%s' contains a base call to '%s' that is only implemented by a type extension it does not reference",
+				mProject->mName.c_str(), MethodToString(declaringMethodInstance).c_str()));
+			continue;
+		}
+
+		// An unresolvable slot is a null vtable entry too - nothing can legitimately call it
+		if ((implMethodInstance == NULL) || (!implMethodInstance->mMethodInstanceGroup->IsImplemented()) || (!implMethodInstance->mIsReified))
+			continue;
+
+		auto moduleMethodInst = GetMethodInstanceAtIdx(implMethodInstance->mMethodInstanceGroup->mOwner,
+			implMethodInstance->mMethodInstanceGroup->mMethodIdx, NULL, BfGetMethodInstanceFlag_NoInline);
+		if (!moduleMethodInst.mFunc)
+			continue;
+
+		StringT<512> thunkName;
+		GetDevirtThunkName(thunkName, typeInstance, declaringMethodInstance);
+
+		BfLogSysM("Creating devirt thunk %s -> %s\n", thunkName.c_str(), MethodToString(implMethodInstance).c_str());
+
+		auto thunkFuncType = mBfIRBuilder->MapMethod(declaringMethodInstance);
+		auto thunkFunc = mBfIRBuilder->CreateFunction(thunkFuncType, BfIRLinkageType_External, thunkName);
+		SetupIRMethod(NULL, thunkFunc, false);
+		mBfIRBuilder->SetActiveFunction(thunkFunc);
+
+		auto entryBlock = mBfIRBuilder->CreateBlock("entry", true);
+		mBfIRBuilder->SetInsertPoint(entryBlock);
+
+		SizedArray<BfIRValue, 8> args;
+		int paramCount = declaringMethodInstance->GetIRFunctionParamCount(this);
+		for (int paramIdx = 0; paramIdx < paramCount; paramIdx++)
+			args.push_back(mBfIRBuilder->GetArgument(paramIdx));
+
+		// Retype 'this' - the implementation may be declared further up the chain (no-op for refs)
+		if ((!declaringMethodInstance->mMethodDef->mIsStatic) && (!args.IsEmpty()))
+		{
+			// GetStructRetIdx is the sret param index, so 'this' shifts only when sret comes first
+			int thisIdx = (declaringMethodInstance->GetStructRetIdx() == 0) ? 1 : 0;
+			if (thisIdx < (int)args.size())
+				args[thisIdx] = mBfIRBuilder->CreateBitCast(args[thisIdx], mBfIRBuilder->MapTypeInstPtr(implMethodInstance->GetOwner()));
+		}
+
+		auto retVal = mBfIRBuilder->CreateCall(moduleMethodInst.mFunc, args);
+
+		// Mirror how GetIRFunctionInfo decides the IR return type
+		BfTypeCode loweredRetTypeCode = BfTypeCode_None;
+		BfTypeCode loweredRetTypeCode2 = BfTypeCode_None;
+		bool hasLoweredRet = (declaringMethodInstance->GetLoweredReturnType(&loweredRetTypeCode, &loweredRetTypeCode2)) && (loweredRetTypeCode != BfTypeCode_None);
+		bool isVoidRet = (!hasLoweredRet) &&
+			((declaringMethodInstance->mReturnType->IsValuelessType()) || (declaringMethodInstance->mReturnType->IsVar()) ||
+			 (declaringMethodInstance->GetStructRetIdx() != -1));
+
+		if (isVoidRet)
+			mBfIRBuilder->CreateRetVoid();
+		else
+			mBfIRBuilder->CreateRet(retVal);
+	}
+
+	if (!origVTable.empty())
+		typeInstance->mVirtualMethodTable = origVTable;
+}
+
+// Two extensions can both override one virtual slot only if their projects can see each other -
+//  that fixes their order, and the later one says 'new override' to select its predecessor. A
+//  mutually invisible pair has no defined order, so which one ends up in the vtable comes down to
+//  compilation order, and the loser is silently dropped.
+// This runs after slotting rather than at method declaration: mid-population every override still
+//  has mVirtualTableIdx of -1, so a legal chain is indistinguishable from a real conflict there,
+//  and which one we happened to see first varied by build config and platform.
+void BfModule::CheckExtensionOverrideConflicts(BfTypeInstance* typeInstance)
+{
+	if (!typeInstance->mTypeDef->mIsCombinedPartial)
+		return;
+
+	// Group the overrides by the slot they occupy. Anything with a single claimant is fine, which is
+	//  the overwhelmingly common case, so this bails out before doing any pairwise work.
+	Dictionary<int, Array<BfMethodInstance*>> slotOverrides;
+	for (auto& methodGroup : typeInstance->mMethodInstanceGroups)
+	{
+		auto methodInstance = methodGroup.mDefault;
+		if ((methodInstance == NULL) || (!methodInstance->mMethodDef->mIsOverride))
+			continue;
+		if ((methodInstance->mMethodDef->mMethodDeclaration == NULL) || (methodInstance->mVirtualTableIdx < 0))
+			continue;
+		// Chained methods (ctors/dtors) are the supported way for several extensions to contribute to
+		//  one member - they all run, so they are not competing for the slot
+		if (methodInstance->mChainType != BfMethodChainType_None)
+			continue;
+
+		Array<BfMethodInstance*>* listPtr = NULL;
+		slotOverrides.TryAdd(methodInstance->mVirtualTableIdx, NULL, &listPtr);
+		listPtr->Add(methodInstance);
+	}
+
+	for (auto& kv : slotOverrides)
+	{
+		auto& overrides = kv.mValue;
+		if (overrides.mSize < 2)
+			continue;
+
+		// Report against the earliest claimant we cannot be ordered against, so the message is stable
+		//  regardless of the order the methods were processed in
+		for (int i = 1; i < overrides.mSize; i++)
+		{
+			auto methodInstance = overrides[i];
+			auto methodDef = methodInstance->mMethodDef;
+
+			for (int j = 0; j < i; j++)
+			{
+				auto prevMethodInstance = overrides[j];
+				auto prevMethodDef = prevMethodInstance->mMethodDef;
+				if (prevMethodDef->mDeclaringType->mProject->ReferencesOrReferencedBy(methodDef->mDeclaringType->mProject))
+					continue;
+
+				BfAstNode* refNode = methodDef->GetRefNode();
+				if (auto propertyMethodDeclaration = methodDef->GetPropertyMethodDeclaration())
+					refNode = propertyMethodDeclaration->mPropertyDeclaration->mVirtualSpecifier;
+				else if (auto methodDeclaration = methodDef->GetMethodDeclaration())
+					refNode = methodDeclaration->mVirtualSpecifier;
+
+				auto error = Fail(StrFormat("Conflicting extension override method '%s'. Project '%s' and project '%s' do not reference each other, so the override order is undefined.",
+					MethodToString(methodInstance).c_str(), methodDef->mDeclaringType->mProject->mName.c_str(),
+					prevMethodDef->mDeclaringType->mProject->mName.c_str()), refNode);
+				if (error != NULL)
+					mCompiler->mPassInstance->MoreInfo("See conflicting override", prevMethodDef->GetRefNode());
+				break;
+			}
+		}
+	}
+}
+
 BfIRValue BfModule::CreateTypeDataRef(BfType* type, bool forceConstant)
 {
 	if (mBfIRBuilder->mIgnoreWrites)
@@ -6353,8 +6689,8 @@ BfIRValue BfModule::GetTypeTypeData(BfType* type, BfCreateTypeDataContext& ctx, 
 		typeFlags |= BfTypeFlags_Object;
 		if ((!wantsTypeDecl) && (typeInstance->mDefineState >= BfTypeDefineState_DefinedAndMethodsSlotted))
 		{
-			BfMethodInstance* methodInstance = typeInstance->mVirtualMethodTable[mCompiler->GetVTableMethodOffset() + 0].mImplementingMethod;
-			if ((methodInstance != NULL) && (methodInstance->GetOwner() != mContext->mBfObjectType))
+			auto methodRef = typeInstance->mVirtualMethodTable[mCompiler->GetVTableMethodOffset() + 0].mImplementingMethod;
+			if ((methodRef.mTypeInstance != NULL) && (methodRef.mTypeInstance != mContext->mBfObjectType))
 				typeFlags |= BfTypeFlags_HasDestructor;
 		}
 	}
@@ -6944,71 +7280,9 @@ BfIRValue BfModule::CreateTypeData(BfType* type, BfCreateTypeDataContext& ctx, b
 				checkTypeInst = checkTypeInst->GetImplBaseType();
 			}
 
-			Array<BfVirtualMethodEntry> origVTable;
+			Array<BfVirtualMethodEntry> origVTable = ReslotVTableForProject(typeInstance);
 
 			int origVirtIdx = 0;
-			if (typeInstance->mTypeDef->mIsCombinedPartial)
-			{
-				HashSet<String> reslotNames;
-				for (int virtIdx = 0; virtIdx < (int)typeInstance->mVirtualMethodTable.size(); virtIdx++)
-				{
-					auto& entry = typeInstance->mVirtualMethodTable[virtIdx];
-					if (entry.mDeclaringMethod.mMethodNum == -1)
-						continue;
-					BfMethodInstance* methodInstance = (BfMethodInstance*)entry.mImplementingMethod;
-					if ((methodInstance == NULL) ||
-						((!mIsComptimeModule) && (!typeInstance->IsTypeMemberAccessible(methodInstance->mMethodDef->mDeclaringType, mProject))))
-					{
-						if (origVTable.empty())
-							origVTable = typeInstance->mVirtualMethodTable;
-
-						BfMethodInstance* declMethodInstance = entry.mDeclaringMethod;
-						if (declMethodInstance != NULL)
-						{
-							if ((mIsComptimeModule) || (typeInstance->IsTypeMemberAccessible(declMethodInstance->mMethodDef->mDeclaringType, mProject)))
-							{
-								// Prepare to reslot...
-								entry.mImplementingMethod = entry.mDeclaringMethod;
-								reslotNames.Add(declMethodInstance->mMethodDef->mName);
-							}
-							else
-							{
-								// Decl isn't accessible, null out entry
-								entry.mImplementingMethod = BfMethodRef();
-							}
-						}
-					}
-				}
-
-				if (!reslotNames.IsEmpty())
-				{
-					BfAmbiguityContext ambiguityContext;
-					ambiguityContext.mTypeInstance = typeInstance;
-					ambiguityContext.mModule = this;
-					ambiguityContext.mIsProjectSpecific = true;
-					ambiguityContext.mIsReslotting = true;
-
-					SetAndRestoreValue<BfTypeInstance*> prevTypeInstance(mCurTypeInstance, typeInstance);
-					for (auto& methodGroup : typeInstance->mMethodInstanceGroups)
-					{
-						auto methodInstance = methodGroup.mDefault;
-						if ((methodInstance == NULL) || (!methodInstance->mMethodDef->mIsOverride))
-							continue;
-
-						if (!reslotNames.Contains(methodInstance->mMethodDef->mName))
-							continue;
-
-						if ((!mIsComptimeModule) && (!typeInstance->IsTypeMemberAccessible(methodInstance->mMethodDef->mDeclaringType, mProject)))
-							continue;
-						if ((methodInstance->mChainType != BfMethodChainType_None) && (methodInstance->mChainType != BfMethodChainType_ChainHead))
-							continue;
-						SlotVirtualMethod(methodInstance, &ambiguityContext);
-					}
-
-					ambiguityContext.Finish();
-				}
-			}
-
 			bool isInExts = false;
 			for (int virtIdx = 0; virtIdx < (int)typeInstance->mVirtualMethodTable.size(); virtIdx++)
 			{
@@ -11486,6 +11760,13 @@ BfMethodInstance* BfModule::GetRawMethodInstance(BfTypeInstance* typeInstance, B
 	{
 		return GetMethodInstance(typeInstance, methodDef, BfTypeVector()).mMethodInstance;
 	}
+
+#ifdef _DEBUG
+	// mIdx indexes the declaring type's method list. Resolving against an unrelated type is only
+	//  caught by the bounds check when the index is too large, else it silently returns a wrong method.
+	if ((methodDef->mIdx >= 0) && (methodDef->mIdx < typeInstance->mTypeDef->mMethods.mSize))
+		BF_ASSERT(typeInstance->mTypeDef->mMethods[methodDef->mIdx] == methodDef);
+#endif
 
 	return GetRawMethodInstanceAtIdx(typeInstance, methodDef->mIdx, NULL);
 }
@@ -24660,16 +24941,10 @@ void BfModule::SetupIRFunction(BfMethodInstance* methodInstance, StringImpl& man
 							(checkMethodInstance->mMethodDef->mMethodDeclaration != NULL) &&
 							(checkMethodInstance->mVirtualTableIdx < 0))
 						{
-							BfAstNode* refNode = methodDef->GetRefNode();
-							if (auto propertyMethodDeclaration = methodDef->GetPropertyMethodDeclaration())
-								refNode = propertyMethodDeclaration->mPropertyDeclaration->mVirtualSpecifier;
-							else if (auto methodDeclaration = methodDef->GetMethodDeclaration())
-								refNode = methodDeclaration->mVirtualSpecifier;
-
-							auto error = Fail(StrFormat("Conflicting extension override method '%s'", MethodToString(methodInstance).c_str()), refNode);
-							if (error != NULL)
-								mCompiler->mPassInstance->MoreInfo("See previous override", checkMethod->GetRefNode());
-
+							// Don't take over another override's function. The conflict itself is reported
+							//  by CheckExtensionOverrideConflicts once slotting is done - at this point every
+							//  override still shares one mangled name, so a legal chain looks identical to a
+							//  real conflict and which one we see first varies by build config and platform.
 							takeover = false;
 							break;
 						}
@@ -25642,7 +25917,8 @@ void BfModule::DoMethodDeclaration(BfMethodDeclaration* methodDeclaration, bool 
 
 			if (!isValid)
 			{
-				Fail("Parameters with 'params' specifiers can only be used for array, span, tuple, delegate, or function types", paramDef->mParamDeclaration->mModToken);
+				if (paramDef->mParamDeclaration != NULL)
+					Fail("Parameters with 'params' specifiers can only be used for array, span, tuple, delegate, or function types", paramDef->mParamDeclaration->mModToken);
 				// Failure case, make it an Object[]
 				resolvedParamType = CreateArrayType(mContext->mBfObjectType, 1);
 			}
@@ -25657,7 +25933,8 @@ void BfModule::DoMethodDeclaration(BfMethodDeclaration* methodDeclaration, bool 
 
 			if (paramDefIdx < (int)methodDef->mParams.size() - 1)
 			{
-				Fail("Only the last parameter can specify 'params'", paramDef->mParamDeclaration->mModToken);
+				if (paramDef->mParamDeclaration != NULL)
+					Fail("Only the last parameter can specify 'params'", paramDef->mParamDeclaration->mModToken);
 			}
 		}
 		else
@@ -26905,11 +27182,12 @@ bool BfModule::SlotVirtualMethod(BfMethodInstance* methodInstance, BfAmbiguityCo
 						setMethodInstance->mVirtualTableIdx = virtualMethodMatchIdx;
 
 						auto& implMethodRef = typeInstance->mVirtualMethodTable[virtualMethodMatchIdx].mImplementingMethod;
-						if ((!mCompiler->mIsResolveOnly) && (implMethodRef.mMethodNum >= 0) &&
+						if ((implMethodRef.mMethodNum >= 0) &&
 							(implMethodRef.mTypeInstance == typeInstance) && (methodInstance->GetOwner() == typeInstance))
 						{
 							auto prevImplMethodInstance = (BfMethodInstance*)implMethodRef;
-							if (prevImplMethodInstance->mMethodDef->mDeclaringType->mProject != methodInstance->mMethodDef->mDeclaringType->mProject)
+							if ((!mCompiler->mIsResolveOnly) &&
+								(prevImplMethodInstance->mMethodDef->mDeclaringType->mProject != methodInstance->mMethodDef->mDeclaringType->mProject))
 							{
 								// We may need to have to previous method reified when we must re-slot in another project during vdata creation
 								BfReifyMethodDependency dep;
@@ -27664,6 +27942,7 @@ void BfModule::ReportMemory(MemReporter* memReporter)
 	memReporter->AddMap(mStaticFieldRefs, false);
 	memReporter->AddMap(mClassVDataRefs, false);
 	memReporter->AddMap("VDataExtMap", mClassVDataExtRefs, false);
+	memReporter->AddMap("DevirtThunkMap", mDevirtThunkRefs, false);
 	memReporter->AddMap(mTypeDataRefs, false);
 	memReporter->AddMap(mDbgRawAllocDataRefs, false);
 	memReporter->AddMap(mDeferredMethodCallData, false);
@@ -27695,6 +27974,7 @@ void BfModule::ClearModuleData(bool clearTransientData)
 
 	mClassVDataRefs.Clear();
 	mClassVDataExtRefs.Clear();
+	mDevirtThunkRefs.Clear();
 	for (auto& kv : mTypeDataRefs)
 		kv.mValue = BfIRValue();
 	mStringCharPtrPool.Clear();

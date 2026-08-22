@@ -2537,7 +2537,7 @@ void BeIRCodeGen::HandleNextCmd()
 						dumpCtx.ToString(errStr, args[argIdx]);
 						errStr += "\n";
 					}
-					FatalError(errStr);
+					Fail(errStr);					
 				}
 			}
 			else

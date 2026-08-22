@@ -65,6 +65,14 @@ namespace LibA
 		}
 	}
 
+	extension LibA5
+	{
+		public override int GetVal()
+		{
+			return 3;
+		}
+	}
+
 	extension LibA3
 	{
 		this
@@ -420,6 +428,15 @@ namespace Tests
 			LibA.LibA0 la0 = scope .();
 			int la0a = la0.GetA();
 			Test.Assert(la0a == 3);
+
+			// LibA compiles LibA5_Derived.GetVal once; its devirtualized 'base.GetVal()' must reach
+			//  this project's extension override even though LibA cannot see it
+			LibA.LibA5_Derived la5d = scope .();
+			Test.Assert(la5d.GetVal() == 1003);
+
+			// LibA0 has two extension overrides (LibA's, then this project's 'new override')
+			LibA.LibA0_Derived la0d = scope .();
+			Test.Assert(la0d.GetA() == 1003);
 
 			LibA.LibA3 la3 = scope .();
 			Test.Assert(la3.mA == 114);

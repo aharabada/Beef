@@ -11,14 +11,14 @@ NS_BF_BEGIN;
 class RenderWindow;
 class Texture;
 class Shader;
+class ComputeShader;
 class ShaderPass;
 class BFApp;
 class Vertex3D;
 class DrawLayer;
 class RenderState;
 
-// Slot 0 = diffuse, slots 1-4 = shadow cascade maps (see ModelStd.fx), with headroom.
-#define MAX_TEXTURES 8
+#define MAX_TEXTURES 32
 
 class DrawBatch : public RenderCmd
 {
@@ -101,8 +101,19 @@ public:
 	void					QueueRenderCmd(RenderCmd* renderCmd);
 	void					QueueRenderable(Renderable* renderable);
 	virtual RenderCmd*		CreateSetTextureCmd(int textureIdx, Texture* texture) = 0;
+	// Deferred like constant data: the upload happens when the queued commands render.
+	virtual void			SetBufferData(Texture* buffer, void* data, int size) {}
+	// Compute bindings, queued in order with the draws. Every Dispatch consumes them: it unbinds
+	// its SRVs/UAVs afterwards so the resources are free for the draws that follow, and drops the
+	// layer's texture cache since a UAV bind may have evicted a pixel-shader binding.
+	virtual void			SetComputeTexture(int slot, Texture* texture) {}
+	virtual void			SetComputeUAV(int slot, Texture* texture, int mipLevel) {}
+	virtual void			Dispatch(ComputeShader* shader, int groupsX, int groupsY, int groupsZ) {}
 	virtual void			SetShaderConstantData(int usageIdx, int slotIdx, void* constData, int size) = 0;
 	virtual void			SetShaderConstantDataTyped(int usageIdx, int slotIdx, void* constData, int size, int* typeData, int typeCount);
+	// Queued draw of instCount copies of a static mesh; instance i's per-instance vertex element (see
+	// VertexDefinition::mInstanceElementIdx) reads the float instBase + i + 1.
+	virtual void			DrawStaticMeshInstanced(StaticMesh* mesh, int instBase, int instCount) {}
 
 public:
 	DrawLayer();

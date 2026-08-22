@@ -37,7 +37,17 @@ namespace Beefy.gfx
 			// Single-channel R8_UNORM -- for scalar masks (eg SSAO).
 			R8 = 8,
 			// RGBA16F -- for linear HDR scene color.
-			F16 = 16
+			F16 = 0x10,
+			// Full mip chain, regenerated on demand with GenerateMips (1-sample, unshared only).
+			Mipmaps = 0x20,
+			// Two-channel R8G8_UNORM -- for paired scalar data (eg AO + packed edges).
+			RG8 = 0x40,
+			// Single-channel R16_FLOAT -- for half-precision data (eg linear depth for screen effects).
+			R16F = 0x80,
+			// Single-channel R32_UINT -- for compute atomics; not filterable, no mips.
+			R32Uint = 0x100,
+			// Also bindable as a compute UAV (RWTexture2D, mip 0); 1-sample, unshared only.
+			UnorderedAccess = 0x200
 		}
 
         public Image mSrcTexture;
@@ -51,6 +61,8 @@ namespace Beefy.gfx
         public float mY;
         public void* mNativeTextureSegment;
         public PixelSnapping mPixelSnapping = PixelSnapping.Auto;
+		// Lazily built by RawView, owned by this Image. Null until something actually asks.
+		Image mRawView ~ delete _;
         
         [CallingConvention(.Stdcall), CLink]
         public static extern void Gfx_DrawTextureSegment(void* textureSegment, float a, float b, float c, float d, float tx, float ty, float z, uint32 color, int32 pixelSnapping);
@@ -71,7 +83,19 @@ namespace Beefy.gfx
 		static extern void* Gfx_CreateDepthImageRef(void* textureSegment);
 
 		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_CreateRawImageRef(void* textureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
 		static extern void Gfx_Texture_ResolveTo(void* srcTextureSegment, void* destTextureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_GenerateMips(void* textureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_CopyToMip(void* destTextureSegment, int32 mipLevel, void* srcTextureSegment, int32 width, int32 height);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_SetSecondaryTarget(void* textureSegment, void* secondarySegment);
 
 		[CallingConvention(.Stdcall), CLink]
 		public static extern void Gfx_SetWindowMsaaSamples(int32 sampleCount);
@@ -162,6 +186,26 @@ namespace Beefy.gfx
 			return CreateFromNativeTextureSegment(aNativeTextureSegment);
 		}
 
+		// The same texels sampled without the sRGB decode, for drawing an image that was loaded as
+		// color data (.Srgb) through the 2D pipeline, which works in sRGB space and would otherwise
+		// render it too dark. Shares this Image's texture -- no extra GPU memory, and nothing is
+		// created unless this is actually read. Null for images that weren't loaded .Srgb, since
+		// those already sample raw; draw those directly.
+		public Image RawView
+		{
+			get
+			{
+				if (mRawView == null)
+				{
+					void* aNativeTextureSegment = Gfx_CreateRawImageRef(mNativeTextureSegment);
+					if (aNativeTextureSegment == null)
+						return null;
+					mRawView = CreateFromNativeTextureSegment(aNativeTextureSegment);
+				}
+				return mRawView;
+			}
+		}
+
 		// Depth-only target (no color plane): draw into it with a DisableRenderTarget +
 		// DisablePixelShader render state; sampling it samples the depth itself (incl. comparison
 		// samplers). GetDepthBits works, GetBits/ResolveTo do not. 1-sample only.
@@ -178,6 +222,26 @@ namespace Beefy.gfx
 		public void ResolveTo(Image dest)
 		{
 			Gfx_Texture_ResolveTo(mNativeTextureSegment, dest.mNativeTextureSegment);
+		}
+
+		// Rebuilds the mip chain from level 0 (render targets created with .Mipmaps only).
+		public void GenerateMips()
+		{
+			Gfx_Texture_GenerateMips(mNativeTextureSegment);
+		}
+
+		// Copies the top-left width x height of `src` into this texture's mip `mipLevel` (same format;
+		// the way to fill mips of a .Mipmaps target other than by GenerateMips).
+		public void CopyToMip(int32 mipLevel, Image src, int32 width, int32 height)
+		{
+			Gfx_Texture_CopyToMip(mNativeTextureSegment, mipLevel, src.mNativeTextureSegment, width, height);
+		}
+
+		// Extra render target bound as SV_Target1 whenever this image is drawn into (same size; null
+		// to clear). Sticky -- keep it set only around the pass that wants it.
+		public void SetSecondaryTarget(Image secondary)
+		{
+			Gfx_Texture_SetSecondaryTarget(mNativeTextureSegment, (secondary != null) ? secondary.mNativeTextureSegment : null);
 		}
         
 		public static Image OpenSharedRenderTarget(void* handle, int32 width, int32 height)

@@ -9,6 +9,7 @@ NS_BF_BEGIN;
 
 class Texture;
 class Shader;
+class ComputeShader;
 class ShaderPass;
 class BFApp;
 
@@ -188,12 +189,16 @@ class VertexDefinition
 public:
 	VertexDefData* mElementData;
 	int mNumElements;
+	// Element that an instanced draw feeds from a per-instance stream instead of the vertex (-1 = none).
+	// Shaders built on this definition get a second input layout for it (see DXShader::mD3DInstLayout).
+	int mInstanceElementIdx;
 
 public:
 	VertexDefinition()
 	{
 		mElementData = NULL;
 		mNumElements = 0;
+		mInstanceElementIdx = -1;
 	}
 
 	VertexDefinition(VertexDefinition* src)
@@ -201,12 +206,42 @@ public:
 		mElementData = new VertexDefData[src->mNumElements];
 		mNumElements = src->mNumElements;
 		memcpy(mElementData, src->mElementData, sizeof(VertexDefData) * mNumElements);
+		mInstanceElementIdx = src->mInstanceElementIdx;
 	}
 
 	virtual ~VertexDefinition()
 	{
 		delete [] mElementData;
 	}
+};
+
+// GPU-resident geometry uploaded once (see RenderDevice::CreateStaticMesh), drawn instanced through
+// DrawLayer::DrawStaticMeshInstanced.
+class StaticMesh
+{
+public:
+	int mVtxSize;
+	int mVtxCount;
+	int mIdxCount;
+	bool mIdx32;
+
+public:
+	StaticMesh()
+	{
+		mVtxSize = 0;
+		mVtxCount = 0;
+		mIdxCount = 0;
+		mIdx32 = false;
+	}
+	virtual ~StaticMesh() {}
+};
+
+// One timed GPU region (see RenderDevice::GpuTimerSpanBegin): mTag is whatever the caller last set
+// with GpuTimerSetTag, so the consumer can attribute the time to its own profiler section.
+struct GpuTimerSpan
+{
+	int mTag;
+	int64 mNanos;
 };
 
 class RenderState
@@ -320,6 +355,9 @@ public:
 public:	
 	virtual void			PhysSetRenderState(RenderState* renderState) = 0;
 	virtual void			PhysSetRenderTarget(Texture* renderTarget) = 0;
+	// Restricts rasterization of the current target to a pixel rect (reset by the next target set);
+	// `clear` clears just that rect first (color + depth).
+	virtual void			PhysSetViewportRect(int x, int y, int width, int height, bool clear) {}
 
 public:
 	RenderDevice();
@@ -334,6 +372,20 @@ public:
 	virtual ModelInstance*	CreateModelInstance(ModelDef* modelDef, ModelCreateFlags flags) { return NULL; }
 	virtual VertexDefinition* CreateVertexDefinition(VertexDefData* elementData, int numElements);	
 
+	// GPU timing. Spans are bracketed around actual submissions (layer flushes, resolves) rather than
+	// around caller code, since queued draws don't execute where they were recorded. Results are read
+	// back a few frames later (GpuTimerFetch), never waited on.
+	virtual void			GpuTimerSetEnabled(bool enabled) {}
+	virtual bool			GpuTimerBeginFrame(int64 frameId) { return false; }
+	virtual void			GpuTimerSetTag(int tag) {}
+	virtual int				GpuTimerSpanBegin() { return -1; }
+	virtual void			GpuTimerSpanEnd(int spanId) {}
+	virtual void			GpuTimerEndFrame() {}
+	// -1 = the oldest frame's results aren't ready yet; otherwise the span count for *outFrameId.
+	virtual int				GpuTimerFetch(int64* outFrameId, GpuTimerSpan* outSpans, int maxSpans) { return -1; }
+	// idxData is uint16 or uint32 per idx32. Delete the mesh only after every layer that queued draws of it has flushed.
+	virtual StaticMesh*		CreateStaticMesh(int vertexSize, void* vtxData, int vtxCount, void* idxData, int idxCount, bool idx32) { return NULL; }
+
 	virtual void			FrameStart() = 0;
 	virtual void			FrameEnd();
 
@@ -343,10 +395,18 @@ public:
 	virtual Texture*		CreateRenderTarget(int width, int height, int flags, int sampleCount) = 0;
 	// Depth-only target: no color plane; the depth buffer itself is the sampleable resource.
 	virtual Texture*		CreateDepthTarget(int width, int height, bool is16Bit) { return NULL; }
+	// GPU structured buffer (StructuredBuffer<T> in HLSL) bound through the texture slots. Flags:
+	// 1 = GPU-writable (RWStructuredBuffer via a compute UAV; SetBufferData uploads instead of maps).
+	// 2 = CPU-updatable in place (default usage, Texture::UpdateBufferRange writes sub-ranges immediately).
+	virtual Texture*		CreateStructuredBuffer(int stride, int count, int flags = 0) { return NULL; }
+	// Volume texture with a UAV per mip (RWTexture3D); flags share CreateRenderTarget's format bits.
+	virtual Texture*		CreateTexture3D(int width, int height, int depth, int flags) { return NULL; }
 	virtual Texture*		OpenSharedRenderTarget(void* handle, int width, int height) { return NULL; }
 	
 	virtual Shader*			LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition) = 0;
 	virtual void			ReleaseShader(Shader* shader);
+	virtual ComputeShader*	LoadComputeShader(const StringImpl& fileName, const StringImpl& entry) { return NULL; }
+	virtual void			ReleaseComputeShader(ComputeShader* shader);
 		
 	virtual void			SetRenderState(RenderState* renderState) = 0;
 };

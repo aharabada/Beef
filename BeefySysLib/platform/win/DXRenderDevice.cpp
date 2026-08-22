@@ -8,6 +8,7 @@
 #include "img/ImageData.h"
 #include "util/PerfTimer.h"
 #include "util/BeefPerf.h"
+#include "util/Hash.h"
 #include "Span.h"
 #include "FileStream.h"
 #include "DDS.h"
@@ -218,6 +219,7 @@ DXShader::DXShader()
 	mD3DPixelShader = NULL;
 	mD3DVertexShader = NULL;
 	mD3DLayout = NULL;
+	mD3DInstLayout = NULL;
 	mConstBuffer = NULL;
 	mHas2DPosition = false;
 }
@@ -236,6 +238,9 @@ void DXShader::ReleaseNative()
 	if (mD3DLayout != NULL)
 		mD3DLayout->Release();
 	mD3DLayout = NULL;
+	if (mD3DInstLayout != NULL)
+		mD3DInstLayout->Release();
+	mD3DInstLayout = NULL;
 	if (mD3DVertexShader != NULL)
 		mD3DVertexShader->Release();
 	mD3DVertexShader = NULL;
@@ -247,111 +252,139 @@ void DXShader::ReleaseNative()
 	mConstBuffer = NULL;
 }
 
-extern "C" typedef HRESULT(WINAPI* Func_D3DX10CompileFromFileW)(LPCWSTR pSrcFile, CONST D3D10_SHADER_MACRO* pDefines, LPD3D10INCLUDE pInclude,
-	LPCSTR pFunctionName, LPCSTR pProfile, UINT Flags1, UINT Flags2, ID3D10Blob** ppShader, ID3D10Blob** ppErrorMsgs);
-static Func_D3DX10CompileFromFileW gFunc_D3DX10CompileFromFileW;
-
 extern "C" typedef HRESULT(WINAPI* Func_D3DX10Compile)(void* srcData, size_t srcSize, char* sourceName, CONST D3D10_SHADER_MACRO* pDefines, LPD3D10INCLUDE pInclude,
 	LPCSTR pFunctionName, LPCSTR pProfile, UINT Flags1, UINT Flags2, ID3D10Blob** ppShader, ID3D10Blob** ppErrorMsgs);
 static Func_D3DX10Compile gFunc_D3DX10Compile;
 
-static bool LoadDXShader(const StringImpl& filePath, const StringImpl& entry, const StringImpl& profile, ID3D10Blob** outBuffer)
+// Compiled shaders are cached next to the source as "<file>_<entry>_<profile>", keyed by a hash of
+// the exact bytes handed to the compiler (plus entry/profile/flags) -- not by file times, which lie
+// whenever a copy preserves mtimes or the clock/zone shifts. Layout: ShaderCacheHeader then the raw
+// DXBC blob. A missing/legacy/mismatched header just means recompile.
+struct ShaderCacheHeader
 {
-	HRESULT hr;
-	String outObj = filePath + "_" + entry + "_" + profile;
+	uint32 mMagic;
+	uint32 mVersion;
+	uint64 mHash;
+};
+static const uint32 cShaderCacheMagic = 0x43534642; // 'BFSC'
+static const uint32 cShaderCacheVersion = 1;
+static const UINT cShaderCompileFlags = D3D10_SHADER_DEBUG | D3D10_SHADER_ENABLE_STRICTNESS;
 
-	bool useCache = false;
-	auto srcDate = ::BfpFile_GetTime_LastWrite(filePath.c_str());
-	auto cacheDate = ::BfpFile_GetTime_LastWrite(outObj.c_str());
-	if ((cacheDate != 0) && (cacheDate >= srcDate))
-		useCache = true;
+static bool ReadShaderCache(const StringImpl& cachePath, uint64 wantHash, bool requireHashMatch, ID3D10Blob** outBuffer)
+{
+	FILE* fp = fopen(cachePath.c_str(), "rb");
+	if (fp == NULL)
+		return false;
 
-	if (!useCache)
+	fseek(fp, 0, SEEK_END);
+	int fileSize = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	ShaderCacheHeader header = { 0 };
+	int blobOfs = 0;
+	if ((fileSize >= (int)sizeof(header)) && (fread(&header, sizeof(header), 1, fp) == 1) &&
+		(header.mMagic == cShaderCacheMagic) && (header.mVersion == cShaderCacheVersion))
 	{
-		if (gFunc_D3DX10CompileFromFileW == NULL)
+		if ((requireHashMatch) && (header.mHash != wantHash))
 		{
-			auto lib = LoadLibraryA("D3DCompiler_47.dll");
-			if (lib != NULL)
-				gFunc_D3DX10CompileFromFileW = (Func_D3DX10CompileFromFileW)::GetProcAddress(lib, "D3DCompileFromFile");
-		}
-
-		if (gFunc_D3DX10CompileFromFileW == NULL)
-			useCache = true;
-	}
-
-	if (!useCache)
-	{
-		bool useCompile = true;
-
-		HRESULT dxResult;
-		ID3D10Blob* errorMessage = NULL;
-		if (useCompile)
-		{
-			if (gFunc_D3DX10Compile == NULL)
-			{
-				auto lib = LoadLibraryA("D3DCompiler_47.dll");
-				if (lib != NULL)
-					gFunc_D3DX10Compile = (Func_D3DX10Compile)::GetProcAddress(lib, "D3DCompile");
-			}
-
-			int memSize = 0;
-			uint8* memPtr = LoadBinaryData(filePath, &memSize);
-
-			dxResult = gFunc_D3DX10Compile(memPtr, memSize, "Shader", NULL, NULL, entry.c_str(), profile.c_str(),
-				D3D10_SHADER_DEBUG | D3D10_SHADER_ENABLE_STRICTNESS, 0, outBuffer, &errorMessage);
-		}
-		else
-		{
-			if (gFunc_D3DX10CompileFromFileW == NULL)
-			{
-				auto lib = LoadLibraryA("D3DCompiler_47.dll");
-				if (lib != NULL)
-					gFunc_D3DX10CompileFromFileW = (Func_D3DX10CompileFromFileW)::GetProcAddress(lib, "D3DCompileFromFile");
-			}
-			
-			dxResult = gFunc_D3DX10CompileFromFileW(UTF8Decode(filePath).c_str(), NULL, NULL, entry.c_str(), profile.c_str(),
-				D3D10_SHADER_DEBUG | D3D10_SHADER_ENABLE_STRICTNESS, 0, outBuffer, &errorMessage);
-		}				
-
-		if (DXFAILED(dxResult))
-		{
-			if (errorMessage != NULL)
-			{
-				BF_FATAL(StrFormat("Vertex shader load failed: %s", (char*)errorMessage->GetBufferPointer()).c_str());
-				errorMessage->Release();
-			}
-			else
-				BF_FATAL("Shader load failed");
+			fclose(fp);
 			return false;
 		}
-
-		auto ptr = (*outBuffer)->GetBufferPointer();
-		int size = (int)(*outBuffer)->GetBufferSize();
-
-		FILE* fp = fopen(outObj.c_str(), "wb");
-		if (fp != NULL)
-		{
-			fwrite(ptr, 1, size, fp);
-			fclose(fp);
-		}
-		return true;
+		blobOfs = sizeof(header);
 	}
-
-	FILE* fp = fopen(outObj.c_str(), "rb");
-	if (fp == NULL)
+	else if (requireHashMatch)
 	{
-		BF_FATAL("Failed to load compiled shader");
+		// Legacy headerless cache (or corrupt) -- can't verify it.
+		fclose(fp);
 		return false;
 	}
 
-	fseek(fp, 0, SEEK_END);
-	int size = ftell(fp);
-	fseek(fp, 0, SEEK_SET);
-	D3D10CreateBlob(size, outBuffer);
-	auto ptr = (*outBuffer)->GetBufferPointer();
-	fread(ptr, 1, size, fp);
+	int blobSize = fileSize - blobOfs;
+	if (blobSize <= 0)
+	{
+		fclose(fp);
+		return false;
+	}
+	fseek(fp, blobOfs, SEEK_SET);
+	D3D10CreateBlob(blobSize, outBuffer);
+	int readSize = (int)fread((*outBuffer)->GetBufferPointer(), 1, blobSize, fp);
 	fclose(fp);
+	return readSize == blobSize;
+}
 
+static void WriteShaderCache(const StringImpl& cachePath, uint64 hash, ID3D10Blob* blob)
+{
+	FILE* fp = fopen(cachePath.c_str(), "wb");
+	if (fp == NULL)
+		return;
+	ShaderCacheHeader header = { cShaderCacheMagic, cShaderCacheVersion, hash };
+	fwrite(&header, sizeof(header), 1, fp);
+	fwrite(blob->GetBufferPointer(), 1, blob->GetBufferSize(), fp);
+	fclose(fp);
+}
+
+static bool LoadDXShader(const StringImpl& filePath, const StringImpl& entry, const StringImpl& profile, ID3D10Blob** outBuffer)
+{
+	String cachePath = filePath + "_" + entry + "_" + profile;
+
+	int srcSize = 0;
+	uint8* srcData = LoadBinaryData(filePath, &srcSize);
+	if (srcData == NULL)
+	{
+		// No source at all (eg a shipped build) -- whatever cache exists is the best we have.
+		if (ReadShaderCache(cachePath, 0, false, outBuffer))
+			return true;
+		BF_FATAL(StrFormat("Shader source not found: %s", filePath.c_str()).c_str());
+		return false;
+	}
+
+	uint64 hash = Hash64(srcData, srcSize);
+	hash = Hash64(entry.c_str(), (int)entry.length(), hash);
+	hash = Hash64(profile.c_str(), (int)profile.length(), hash);
+	hash = Hash64(&cShaderCompileFlags, sizeof(cShaderCompileFlags), hash);
+
+	if (ReadShaderCache(cachePath, hash, true, outBuffer))
+	{
+		delete [] srcData;
+		return true;
+	}
+
+	if (gFunc_D3DX10Compile == NULL)
+	{
+		auto lib = LoadLibraryA("D3DCompiler_47.dll");
+		if (lib != NULL)
+			gFunc_D3DX10Compile = (Func_D3DX10Compile)::GetProcAddress(lib, "D3DCompile");
+	}
+	if (gFunc_D3DX10Compile == NULL)
+	{
+		// No compiler on this machine: a stale cache still beats nothing.
+		delete [] srcData;
+		if (ReadShaderCache(cachePath, hash, false, outBuffer))
+			return true;
+		BF_FATAL("Shader compiler unavailable and no cached shader");
+		return false;
+	}
+
+	// Compiled from the in-memory bytes (the same bytes the hash covers) -- note this means #include
+	// isn't supported.
+	ID3D10Blob* errorMessage = NULL;
+	HRESULT dxResult = gFunc_D3DX10Compile(srcData, srcSize, "Shader", NULL, NULL, entry.c_str(), profile.c_str(),
+		cShaderCompileFlags, 0, outBuffer, &errorMessage);
+	delete [] srcData;
+
+	if (FAILED(dxResult))
+	{
+		if (errorMessage != NULL)
+		{
+			BF_FATAL(StrFormat("Shader compile failed (%s): %s", filePath.c_str(), (char*)errorMessage->GetBufferPointer()).c_str());
+			errorMessage->Release();
+		}
+		else
+			BF_FATAL(StrFormat("Shader compile failed: %s", filePath.c_str()).c_str());
+		return false;
+	}
+
+	WriteShaderCache(cachePath, hash, *outBuffer);
 	return true;
 }
 
@@ -432,6 +465,7 @@ bool DXShader::Load()
 	mHas2DPosition = false;
 	mVertexSize = 0;
 	mD3DLayout = NULL;
+	mD3DInstLayout = NULL;
 
 	static const char* semanticNames[] = {
 		"POSITION",
@@ -511,6 +545,30 @@ bool DXShader::Load()
 	if (FAILED(result))
 		return false;
 
+	int instElemIdx = mVertexDef->mInstanceElementIdx;
+	if ((instElemIdx >= 0) && (instElemIdx < mVertexDef->mNumElements))
+	{
+		// Same vertex layout, but the instance element comes from slot 1 (per-instance stream). Explicit
+		// slot-0 offsets keep the vertex stride identical to the non-instanced layout.
+		D3D11_INPUT_ELEMENT_DESC instLayout[64];
+		int ofs = 0;
+		for (int elementIdx = 0; elementIdx < mVertexDef->mNumElements; elementIdx++)
+		{
+			instLayout[elementIdx] = layout[elementIdx];
+			instLayout[elementIdx].AlignedByteOffset = ofs;
+			ofs += dxgiSize[mVertexDef->mElementData[elementIdx].mFormat];
+		}
+		instLayout[instElemIdx].InputSlot = 1;
+		instLayout[instElemIdx].AlignedByteOffset = 0;
+		instLayout[instElemIdx].InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
+		instLayout[instElemIdx].InstanceDataStepRate = 1;
+		result = mRenderDevice->mD3DDevice->CreateInputLayout(instLayout, mVertexDef->mNumElements, vertexShaderBuffer->GetBufferPointer(),
+			vertexShaderBuffer->GetBufferSize(), &mD3DInstLayout);
+		DXCHECK(result);
+		if (FAILED(result))
+			return false;
+	}
+
 	// Create the vertex shader from the buffer.
 	result = mRenderDevice->mD3DDevice->CreateVertexShader(vertexShaderBuffer->GetBufferPointer(), vertexShaderBuffer->GetBufferSize(), NULL, &mD3DVertexShader);
 	DXCHECK(result);
@@ -566,6 +624,8 @@ DXTexture::DXTexture()
 	mContentBits = NULL;
 	mD3DFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 	mSampleCount = 1;
+	mStandardDepthClear = false;
+	mD3DUAV = NULL;
 }
 
 DXTexture::~DXTexture()
@@ -585,6 +645,8 @@ DXTexture::~DXTexture()
 		mD3DDepthBuffer->Release();
 	if (mD3DKeyedMutex != NULL)
 		mD3DKeyedMutex->Release();
+	if (mD3DUAV != NULL)
+		mD3DUAV->Release();
 	if (mD3DTexture != NULL)
 		mD3DTexture->Release();
 	if (mRenderDevice != NULL)
@@ -619,6 +681,11 @@ void DXTexture::ReleaseNative()
 	{
 		mD3DKeyedMutex->Release();
 		mD3DKeyedMutex = NULL;
+	}
+	if (mD3DUAV != NULL)
+	{
+		mD3DUAV->Release();
+		mD3DUAV = NULL;
 	}
 	if (mD3DTexture != NULL)
 	{
@@ -682,9 +749,14 @@ void DXTexture::PhysSetAsTarget()
 
 		mRenderDevice->mCurD3DRTV = mD3DRenderTargetView;
 		mRenderDevice->mCurD3DDSV = mD3DDepthStencilView;
-		mRenderDevice->mD3DDeviceContext->OMSetRenderTargets(1, &mD3DRenderTargetView, mD3DDepthStencilView);
-		//mRenderDevice->mD3DDeviceContext->OMSetRenderTargets(1, &mD3DRenderTargetView, ((rand() % 2) != 0) ? NULL : mD3DDepthStencilView);
-		//mRenderDevice->mD3DDeviceContext->OMSetRenderTargets(1, &mD3DRenderTargetView, NULL);
+		ID3D11RenderTargetView* rtvs[2] = { mD3DRenderTargetView, NULL };
+		int rtvCount = 1;
+		if (mSecondaryTarget != NULL)
+		{
+			rtvs[1] = ((DXTexture*)mSecondaryTarget)->mD3DRenderTargetView;
+			rtvCount = 2;
+		}
+		mRenderDevice->mD3DDeviceContext->OMSetRenderTargets(rtvCount, rtvs, mD3DDepthStencilView);
 		mRenderDevice->mD3DDeviceContext->RSSetViewports(1, &viewPort);
 	}
 
@@ -694,7 +766,7 @@ void DXTexture::PhysSetAsTarget()
 		if (mD3DRenderTargetView != NULL)
 			mRenderDevice->mD3DDeviceContext->ClearRenderTargetView(mD3DRenderTargetView, bgColor);
 		if (mD3DDepthStencilView != NULL)
-			mRenderDevice->mD3DDeviceContext->ClearDepthStencilView(mD3DDepthStencilView, D3D11_CLEAR_DEPTH/*|D3D11_CLEAR_STENCIL*/, 1.0f, 0);
+			mRenderDevice->mD3DDeviceContext->ClearDepthStencilView(mD3DDepthStencilView, D3D11_CLEAR_DEPTH/*|D3D11_CLEAR_STENCIL*/, mStandardDepthClear ? 1.0f : 0.0f, 0);
 
 		//mRenderDevice->mD3DDevice->ClearRenderTargetView(mD3DRenderTargetView, D3DXVECTOR4(1, 0.5, 0.5, 1));
 		mHasBeenDrawnTo = true;
@@ -702,6 +774,180 @@ void DXTexture::PhysSetAsTarget()
 			mWantsClear = false;
 	}
 }
+
+///
+
+DXStructuredBuffer::DXStructuredBuffer()
+{
+	mD3DBuffer = NULL;
+	mD3DStaging = NULL;
+	mStride = 0;
+	mGpuWritable = false;
+	mDefaultUsage = false;
+}
+
+DXStructuredBuffer::~DXStructuredBuffer()
+{
+	if (mD3DBuffer != NULL)
+		mD3DBuffer->Release();
+	if (mD3DStaging != NULL)
+		mD3DStaging->Release();
+}
+
+void DXStructuredBuffer::PhysSetAsTarget()
+{
+	BF_FATAL("Structured buffers can't be render targets");
+}
+
+void DXStructuredBuffer::UpdateBufferRange(int offset, void* data, int size)
+{
+	BF_ASSERT(mDefaultUsage);
+	BF_ASSERT((offset >= 0) && (size > 0) && (offset + size <= mStride * mWidth));
+	D3D11_BOX box = { (UINT)offset, 0, 0, (UINT)(offset + size), 1, 1 };
+	mRenderDevice->mD3DDeviceContext->UpdateSubresource(mD3DBuffer, 0, &box, data, 0, 0);
+}
+
+bool DXStructuredBuffer::GetBufferData(void* outData, int size)
+{
+	int byteWidth = mStride * mWidth;
+	if ((size <= 0) || (size > byteWidth))
+		return false;
+	auto ctx = mRenderDevice->mD3DDeviceContext;
+	if (mD3DStaging == NULL)
+	{
+		D3D11_BUFFER_DESC desc;
+		ZeroMemory(&desc, sizeof(desc));
+		desc.Usage = D3D11_USAGE_STAGING;
+		desc.ByteWidth = byteWidth;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		desc.StructureByteStride = mStride;
+		if (FAILED(mRenderDevice->mD3DDevice->CreateBuffer(&desc, NULL, &mD3DStaging)))
+			return false;
+	}
+	ctx->CopyResource(mD3DStaging, mD3DBuffer);
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (FAILED(ctx->Map(mD3DStaging, 0, D3D11_MAP_READ, 0, &mapped)))
+		return false;
+	memcpy(outData, mapped.pData, size);
+	ctx->Unmap(mD3DStaging, 0);
+	return true;
+}
+
+///
+
+DXTexture3D::DXTexture3D()
+{
+	mD3DTexture3D = NULL;
+	mD3DStaging = NULL;
+	for (int i = 0; i < cMaxMips; i++)
+		mD3DUAVs[i] = NULL;
+	mDepth = 0;
+	mMipLevels = 1;
+	mBytesPerTexel = 4;
+}
+
+DXTexture3D::~DXTexture3D()
+{
+	for (int i = 0; i < cMaxMips; i++)
+		if (mD3DUAVs[i] != NULL)
+			mD3DUAVs[i]->Release();
+	if (mD3DStaging != NULL)
+		mD3DStaging->Release();
+	if (mD3DTexture3D != NULL)
+		mD3DTexture3D->Release();
+}
+
+void DXTexture3D::PhysSetAsTarget()
+{
+	BF_FATAL("3D textures can't be render targets");
+}
+
+void DXTexture3D::SetData3D(int mipLevel, void* data, int rowPitch, int slicePitch)
+{
+	if ((mipLevel < 0) || (mipLevel >= mMipLevels))
+		return;
+	mRenderDevice->mD3DDeviceContext->UpdateSubresource(mD3DTexture3D, mipLevel, NULL, data, rowPitch, slicePitch);
+}
+
+bool DXTexture3D::GetData3D(int mipLevel, void* outData, int outSize)
+{
+	if ((mipLevel < 0) || (mipLevel >= mMipLevels))
+		return false;
+	int w = BF_MAX(1, mWidth >> mipLevel);
+	int h = BF_MAX(1, mHeight >> mipLevel);
+	int d = BF_MAX(1, mDepth >> mipLevel);
+	int rowBytes = w * mBytesPerTexel;
+	if (outSize < rowBytes * h * d)
+		return false;
+
+	auto ctx = mRenderDevice->mD3DDeviceContext;
+	if (mD3DStaging == NULL)
+	{
+		D3D11_TEXTURE3D_DESC desc;
+		mD3DTexture3D->GetDesc(&desc);
+		desc.Usage = D3D11_USAGE_STAGING;
+		desc.BindFlags = 0;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		desc.MiscFlags = 0;
+		if (FAILED(mRenderDevice->mD3DDevice->CreateTexture3D(&desc, NULL, &mD3DStaging)))
+			return false;
+	}
+	ctx->CopyResource(mD3DStaging, mD3DTexture3D);
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (FAILED(ctx->Map(mD3DStaging, mipLevel, D3D11_MAP_READ, 0, &mapped)))
+		return false;
+	uint8* dest = (uint8*)outData;
+	for (int z = 0; z < d; z++)
+	{
+		for (int y = 0; y < h; y++)
+		{
+			memcpy(dest, (uint8*)mapped.pData + z * mapped.DepthPitch + y * mapped.RowPitch, rowBytes);
+			dest += rowBytes;
+		}
+	}
+	ctx->Unmap(mD3DStaging, mipLevel);
+	return true;
+}
+
+void DXTexture3D::GenerateMips()
+{
+	if (mMipLevels > 1)
+		mRenderDevice->mD3DDeviceContext->GenerateMips(mD3DResourceView);
+}
+
+///
+
+DXComputeShader::DXComputeShader()
+{
+	mRenderDevice = NULL;
+	mD3DComputeShader = NULL;
+}
+
+DXComputeShader::~DXComputeShader()
+{
+	if (mD3DComputeShader != NULL)
+		mD3DComputeShader->Release();
+	if (mRenderDevice != NULL)
+		mRenderDevice->mComputeShaders.Remove(this);
+}
+
+bool DXComputeShader::Load()
+{
+	if (mRenderDevice->mD3DDevice->GetFeatureLevel() < D3D_FEATURE_LEVEL_11_0)
+	{
+		BF_FATAL("Compute shaders need a Direct3D 11.0 feature level device");
+		return false;
+	}
+	ID3D10Blob* blob = NULL;
+	if (!LoadDXShader(mSrcPath + ".fx", mEntry, "cs_5_0", &blob))
+		return false;
+	HRESULT hr = mRenderDevice->mD3DDevice->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), NULL, &mD3DComputeShader);
+	blob->Release();
+	return SUCCEEDED(hr);
+}
+
+///
 
 void DXTexture::Blt(ImageData* imageData, int x, int y)
 {
@@ -849,6 +1095,38 @@ Texture* DXTexture::CreateDepthRef()
 	return ref;
 }
 
+// Second view over the same texels, minus the sRGB decode. Only TYPELESS resources (ie ones loaded
+// with TextureFlag_Srgb) can be re-viewed; anything else already samples raw, so there's nothing to
+// alias and this returns NULL. The resource is shared and refcounted, so the ref and the original
+// can be released in either order.
+Texture* DXTexture::CreateRawRef()
+{
+	if ((mD3DTexture == NULL) || (mD3DFormat != DXGI_FORMAT_R8G8B8A8_TYPELESS))
+		return NULL;
+
+	D3D11_TEXTURE2D_DESC desc;
+	mD3DTexture->GetDesc(&desc);
+
+	DXTexture* ref = new DXTexture();
+	ref->mWidth = mWidth;
+	ref->mHeight = mHeight;
+	ref->mRenderDevice = mRenderDevice;
+	ref->mD3DTexture = mD3DTexture;
+	mD3DTexture->AddRef();
+	ref->mD3DFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srDesc;
+	ZeroMemory(&srDesc, sizeof(srDesc));
+	srDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	srDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srDesc.Texture2D.MostDetailedMip = 0;
+	srDesc.Texture2D.MipLevels = desc.MipLevels;
+	DXCHECK(((DXRenderDevice*)mRenderDevice)->mD3DDevice->CreateShaderResourceView(mD3DTexture, &srDesc, &ref->mD3DResourceView));
+
+	ref->AddRef();
+	return ref;
+}
+
 void* DXTexture::GetSharedHandle()
 {
 	IDXGIResource* dxgiResource = NULL;
@@ -884,6 +1162,19 @@ void DXTexture::ResolveTo(Texture* dest)
 	BF_ASSERT(dxDest->mSampleCount == 1);
 	BF_ASSERT((mWidth == dxDest->mWidth) && (mHeight == dxDest->mHeight) && (mD3DFormat == dxDest->mD3DFormat));
 	((DXRenderDevice*)mRenderDevice)->mD3DDeviceContext->ResolveSubresource(dxDest->mD3DTexture, 0, mD3DTexture, 0, mD3DFormat);
+}
+
+void DXTexture::GenerateMips()
+{
+	((DXRenderDevice*)mRenderDevice)->mD3DDeviceContext->GenerateMips(mD3DResourceView);
+}
+
+void DXTexture::CopyToMip(int mipLevel, Texture* src, int width, int height)
+{
+	DXTexture* dxSrc = (DXTexture*)src;
+	BF_ASSERT(dxSrc->mD3DFormat == mD3DFormat);
+	D3D11_BOX box = { 0, 0, 0, (UINT)width, (UINT)height, 1 };
+	((DXRenderDevice*)mRenderDevice)->mD3DDeviceContext->CopySubresourceRegion(mD3DTexture, mipLevel, 0, 0, 0, dxSrc->mD3DTexture, 0, &box);
 }
 
 ///
@@ -984,6 +1275,116 @@ void DXDrawBatch::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
 	aRenderDevice->mD3DDeviceContext->DrawIndexed(mIdxIdx, idxByteStart / sizeof(uint16), vtxStartIdx/*vtxByteStart / mVtxSize*/);
 }
 
+DXStaticMesh::DXStaticMesh()
+{
+	mD3DVertexBuffer = NULL;
+	mD3DIndexBuffer = NULL;
+}
+
+DXStaticMesh::~DXStaticMesh()
+{
+	if (mD3DVertexBuffer != NULL)
+		mD3DVertexBuffer->Release();
+	if (mD3DIndexBuffer != NULL)
+		mD3DIndexBuffer->Release();
+}
+
+StaticMesh* DXRenderDevice::CreateStaticMesh(int vertexSize, void* vtxData, int vtxCount, void* idxData, int idxCount, bool idx32)
+{
+	DXStaticMesh* mesh = new DXStaticMesh();
+	mesh->mVtxSize = vertexSize;
+	mesh->mVtxCount = vtxCount;
+	mesh->mIdxCount = idxCount;
+	mesh->mIdx32 = idx32;
+
+	D3D11_BUFFER_DESC bd = { 0 };
+	bd.Usage = D3D11_USAGE_IMMUTABLE;
+	bd.ByteWidth = vertexSize * vtxCount;
+	bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+	D3D11_SUBRESOURCE_DATA init = { 0 };
+	init.pSysMem = vtxData;
+	HRESULT result = mD3DDevice->CreateBuffer(&bd, &init, &mesh->mD3DVertexBuffer);
+	DXCHECK(result);
+
+	bd.ByteWidth = (idx32 ? sizeof(uint32) : sizeof(uint16)) * idxCount;
+	bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+	init.pSysMem = idxData;
+	result = mD3DDevice->CreateBuffer(&bd, &init, &mesh->mD3DIndexBuffer);
+	DXCHECK(result);
+
+	if ((mesh->mD3DVertexBuffer == NULL) || (mesh->mD3DIndexBuffer == NULL))
+	{
+		delete mesh;
+		return NULL;
+	}
+	return mesh;
+}
+
+void DXRenderDevice::EnsureInstIota(int count)
+{
+	if (count <= mInstIotaCount)
+		return;
+	int newCount = BF_MAX(count, BF_MAX(mInstIotaCount * 2, 65536));
+	float* data = new float[newCount];
+	for (int i = 0; i < newCount; i++)
+		data[i] = (float)(i + 1);
+	if (mInstIotaBuffer != NULL)
+		mInstIotaBuffer->Release();
+	mInstIotaBuffer = NULL;
+	D3D11_BUFFER_DESC bd = { 0 };
+	bd.Usage = D3D11_USAGE_IMMUTABLE;
+	bd.ByteWidth = sizeof(float) * newCount;
+	bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+	D3D11_SUBRESOURCE_DATA init = { 0 };
+	init.pSysMem = data;
+	DXCHECK(mD3DDevice->CreateBuffer(&bd, &init, &mInstIotaBuffer));
+	delete [] data;
+	mInstIotaCount = newCount;
+}
+
+void DXStaticMeshDrawCmd::CommandQueued(DrawLayer* drawLayer)
+{
+	mRenderState = drawLayer->mRenderDevice->mCurRenderState;
+}
+
+void DXStaticMeshDrawCmd::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
+{
+	if ((mMesh == NULL) || (mInstCount <= 0))
+		return;
+	if ((mRenderState->mClipped) &&
+		((mRenderState->mClipRect.width == 0) || (mRenderState->mClipRect.height == 0)))
+		return;
+
+	DXRenderDevice* dev = (DXRenderDevice*)renderDevice;
+	if (mRenderState != dev->mPhysRenderState)
+		dev->PhysSetRenderState(mRenderState);
+	DXShader* shader = (DXShader*)mRenderState->mShader;
+	if ((shader == NULL) || (shader->mD3DInstLayout == NULL))
+		return; // the shader's vertex definition has no instance element
+	dev->EnsureInstIota(mInstBase + mInstCount);
+
+	ID3D11DeviceContext* ctx = dev->mD3DDeviceContext;
+	ctx->IASetInputLayout(shader->mD3DInstLayout);
+	ID3D11Buffer* bufs[2] = { mMesh->mD3DVertexBuffer, dev->mInstIotaBuffer };
+	UINT strides[2] = { (UINT)mMesh->mVtxSize, sizeof(float) };
+	UINT offsets[2] = { 0, (UINT)(mInstBase * sizeof(float)) };
+	ctx->IASetVertexBuffers(0, 2, bufs, strides, offsets);
+	ctx->IASetIndexBuffer(mMesh->mD3DIndexBuffer, mMesh->mIdx32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, 0);
+	ctx->DrawIndexedInstanced(mMesh->mIdxCount, mInstCount, 0, 0, 0);
+	// PhysSetRenderState only sets the layout on a shader change, so put the batch layout back for the
+	// dynamic batches that follow under this same render state.
+	ctx->IASetInputLayout(shader->mD3DLayout);
+}
+
+void DXDrawLayer::DrawStaticMeshInstanced(StaticMesh* mesh, int instBase, int instCount)
+{
+	DXStaticMeshDrawCmd* cmd = AllocRenderCmd<DXStaticMeshDrawCmd>();
+	cmd->mMesh = (DXStaticMesh*)mesh;
+	cmd->mInstBase = instBase;
+	cmd->mInstCount = instCount;
+	QueueRenderCmd(cmd);
+}
+
 DXDrawLayer::DXDrawLayer()
 {
 }
@@ -1008,6 +1409,7 @@ RenderCmd* Beefy::DXDrawLayer::CreateSetTextureCmd(int textureIdx, Texture* text
 
 void DXRenderDevice::PhysSetRenderState(RenderState* renderState)
 {
+	BP_ZONE("DXRenderDevice::PhysSetRenderState");
 	DXRenderState* dxRenderState = (DXRenderState*)renderState;
 	DXShader* dxShader = (DXShader*)renderState->mShader;
 
@@ -1223,6 +1625,48 @@ void DXRenderDevice::PhysSetRenderTarget(Texture* renderTarget)
 	renderTarget->PhysSetAsTarget();
 }
 
+void DXRenderDevice::PhysSetViewportRect(int x, int y, int width, int height, bool clear)
+{
+	D3D11_VIEWPORT viewPort;
+	viewPort.TopLeftX = (float)x;
+	viewPort.TopLeftY = (float)y;
+	viewPort.Width = (float)width;
+	viewPort.Height = (float)height;
+	viewPort.MinDepth = 0.0f;
+	viewPort.MaxDepth = 1.0f;
+	mD3DDeviceContext->RSSetViewports(1, &viewPort);
+
+	if (!clear)
+		return;
+	D3D11_RECT rect = { x, y, x + width, y + height };
+	if (mD3DDeviceContext1 != NULL)
+	{
+		if (mCurD3DRTV != NULL)
+		{
+			float bgColor[4] = { 1, 0, 0.5f, 1 };
+			mD3DDeviceContext1->ClearView(mCurD3DRTV, bgColor, &rect, 1);
+		}
+		if (mCurD3DDSV != NULL)
+		{
+			// ClearView on a depth view takes the depth from Color[0] (depth-only formats, which is
+			// all our depth targets use).
+			float depth[4] = { 1, 0, 0, 0 };
+			mD3DDeviceContext1->ClearView(mCurD3DDSV, depth, &rect, 1);
+		}
+	}
+	else
+	{
+		// 11.0 fallback: no rect clears, so the whole target goes.
+		if (mCurD3DRTV != NULL)
+		{
+			float bgColor[4] = { 1, 0, 0.5f, 1 };
+			mD3DDeviceContext->ClearRenderTargetView(mCurD3DRTV, bgColor);
+		}
+		if (mCurD3DDSV != NULL)
+			mD3DDeviceContext->ClearDepthStencilView(mCurD3DDSV, D3D11_CLEAR_DEPTH, 1.0f, 0);
+	}
+}
+
 RenderState* DXRenderDevice::CreateRenderState(RenderState* srcRenderState)
 {
 	DXRenderState* renderState = new DXRenderState();
@@ -1252,6 +1696,7 @@ struct DXModelVertex
 	Vector3 mNormal;
 	TexCoords mBumpTexCoords;
 	Vector3 mTangent;
+	float mInstanceIdx; // 0 = per-draw constants (see Gfx_DrawIndexedVerticesInst)
 };
 
 ModelInstance* DXRenderDevice::CreateModelInstance(ModelDef* modelDef, ModelCreateFlags flags)
@@ -1267,7 +1712,8 @@ ModelInstance* DXRenderDevice::CreateModelInstance(ModelDef* modelDef, ModelCrea
 		{VertexElementUsage_TextureCoordinate,	0, VertexElementFormat_Vector2},
 		{VertexElementUsage_Normal,				0, VertexElementFormat_Vector3},
 		{VertexElementUsage_TextureCoordinate,	1, VertexElementFormat_Vector2},
-		{VertexElementUsage_Tangent,			0, VertexElementFormat_Vector3}
+		{VertexElementUsage_Tangent,			0, VertexElementFormat_Vector3},
+		{VertexElementUsage_TextureCoordinate,	2, VertexElementFormat_Single}
 	};
 
 	auto vertexDefinition = CreateVertexDefinition(vertexDefData, sizeof(vertexDefData) / sizeof(vertexDefData[0]));
@@ -1392,6 +1838,7 @@ ModelInstance* DXRenderDevice::CreateModelInstance(ModelDef* modelDef, ModelCrea
 				destVtx->mBumpTexCoords = srcVtxData->mBumpTexCoords;
 				destVtx->mColor = srcVtxData->mColor;
 				destVtx->mTangent = srcVtxData->mTangent;
+				destVtx->mInstanceIdx = 0;
 			}
 
 			mD3DDeviceContext->Unmap(dxPrimitives->mD3DVertexBuffer, 0);
@@ -1401,6 +1848,49 @@ ModelInstance* DXRenderDevice::CreateModelInstance(ModelDef* modelDef, ModelCrea
 	}
 
 	return dxModelInstance;
+}
+
+void DXDrawLayer::SetBufferData(Texture* buffer, void* data, int size)
+{
+	DXSetBufferDataCmd* cmd = AllocRenderCmd<DXSetBufferDataCmd>();
+	cmd->mBuffer = (DXStructuredBuffer*)buffer;
+	cmd->mSize = size;
+	cmd->mData = new uint8[size];
+	memcpy(cmd->mData, data, size);
+	QueueRenderCmd(cmd);
+}
+
+void DXDrawLayer::SetComputeTexture(int slot, Texture* texture)
+{
+	BF_ASSERT((slot >= 0) && (slot < 32));
+	DXSetComputeTextureCmd* cmd = AllocRenderCmd<DXSetComputeTextureCmd>();
+	cmd->mSlot = slot;
+	cmd->mTexture = (DXTexture*)texture;
+	QueueRenderCmd(cmd);
+}
+
+void DXDrawLayer::SetComputeUAV(int slot, Texture* texture, int mipLevel)
+{
+	BF_ASSERT((slot >= 0) && (slot < D3D11_PS_CS_UAV_REGISTER_COUNT));
+	DXSetComputeUAVCmd* cmd = AllocRenderCmd<DXSetComputeUAVCmd>();
+	cmd->mSlot = slot;
+	cmd->mMipLevel = mipLevel;
+	cmd->mTexture = (DXTexture*)texture;
+	QueueRenderCmd(cmd);
+}
+
+void DXDrawLayer::Dispatch(ComputeShader* shader, int groupsX, int groupsY, int groupsZ)
+{
+	DXDispatchCmd* cmd = AllocRenderCmd<DXDispatchCmd>();
+	cmd->mShader = (DXComputeShader*)shader;
+	cmd->mGroupsX = groupsX;
+	cmd->mGroupsY = groupsY;
+	cmd->mGroupsZ = groupsZ;
+	QueueRenderCmd(cmd);
+	// A UAV bind evicts any pixel-shader view of the same resource, so the next SetTexture must
+	// re-bind even when this layer thinks the slot is current.
+	for (int texIdx = 0; texIdx < MAX_TEXTURES; texIdx++)
+		mCurTextures[texIdx] = (Texture*)(intptr)-1;
 }
 
 void DXDrawLayer::SetShaderConstantData(int usageIdx, int slotIdx, void* constData, int size)
@@ -1755,6 +2245,7 @@ void Beefy::DXModelInstance::CommandQueued(RenderCmd* renderCmd, DrawLayer* draw
 				destVtx->mTexCoords = srcVtxData->mTexCoords;
 				destVtx->mBumpTexCoords = srcVtxData->mBumpTexCoords;
 				destVtx->mColor = 0xFFFFFFFF; //TODO: Color
+				destVtx->mInstanceIdx = 0;
 			}
 
 			dxRenderDevice->mD3DDeviceContext->Unmap(dxPrims->mD3DVertexBuffer, 0);
@@ -1769,16 +2260,47 @@ void Beefy::DXModelInstance::CommandQueued(RenderCmd* renderCmd, DrawLayer* draw
 void DXSetTextureCmd::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
 {
 	DXRenderDevice* dxRenderDevice = (DXRenderDevice*)renderDevice;
-	dxRenderDevice->mD3DDeviceContext->PSSetShaderResources(mTextureIdx, 1, &((DXTexture*)mTexture)->mD3DResourceView);
+	ID3D11ShaderResourceView* srv = ((DXTexture*)mTexture)->mD3DResourceView;
+	dxRenderDevice->mD3DDeviceContext->PSSetShaderResources(mTextureIdx, 1, &srv);
+	// Slots from DX_VS_TEXTURE_SLOT up are readable by the vertex stage too (per-draw instance records).
+	if (mTextureIdx >= DX_VS_TEXTURE_SLOT)
+		dxRenderDevice->mD3DDeviceContext->VSSetShaderResources(mTextureIdx, 1, &srv);
+}
+
+///
+
+void DXSetBufferDataCmd::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
+{
+	DXRenderDevice* dxRenderDevice = (DXRenderDevice*)renderDevice;
+	int byteWidth = mBuffer->mStride * mBuffer->mWidth;
+	BF_ASSERT(mSize <= byteWidth);
+
+	if (mBuffer->mDefaultUsage)
+	{
+		// USAGE_DEFAULT can't be mapped; a partial upload keeps the tail.
+		D3D11_BOX box = { 0, 0, 0, (UINT)mSize, 1, 1 };
+		dxRenderDevice->mD3DDeviceContext->UpdateSubresource(mBuffer->mD3DBuffer, 0, &box, mData, 0, 0);
+		return;
+	}
+
+	D3D11_MAPPED_SUBRESOURCE mappedResource;
+	if (FAILED(dxRenderDevice->mD3DDeviceContext->Map(mBuffer->mD3DBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource)))
+		return;
+	memcpy(mappedResource.pData, mData, mSize);
+	dxRenderDevice->mD3DDeviceContext->Unmap(mBuffer->mD3DBuffer, 0);
+}
+
+void DXSetBufferDataCmd::Free()
+{
+	delete[] mData;
+	mData = NULL;
+	RenderCmd::Free();
 }
 
 ///
 
 void DXSetConstantData::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
 {
-	//SetRenderState();
-
-	DXShader* dxShader = (DXShader*)renderDevice->mCurRenderState->mShader;
 	DXRenderDevice* dxRenderDevice = (DXRenderDevice*)renderDevice;
 
 	HRESULT result = 0;
@@ -1820,14 +2342,65 @@ void DXSetConstantData::Render(RenderDevice* renderDevice, RenderWindow* renderW
 
 	dxRenderDevice->mD3DDeviceContext->Unmap(buffer, 0);
 	if (mUsageIdx == 0)
-	{
-		//OutputDebugStrF("VSSetConstantBuffers %d %p\n", mSlotIdx, buffer);
 		dxRenderDevice->mD3DDeviceContext->VSSetConstantBuffers(mSlotIdx, 1, &buffer);
-	}
+	else if (mUsageIdx == 2)
+		dxRenderDevice->mD3DDeviceContext->CSSetConstantBuffers(mSlotIdx, 1, &buffer);
 	else
-	{
-		//OutputDebugStrF("PSSetConstantBuffers %d %p\n", mSlotIdx, buffer);
 		dxRenderDevice->mD3DDeviceContext->PSSetConstantBuffers(mSlotIdx, 1, &buffer);
+}
+
+///
+
+void DXSetComputeTextureCmd::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
+{
+	DXRenderDevice* dxRenderDevice = (DXRenderDevice*)renderDevice;
+	ID3D11ShaderResourceView* srv = (mTexture != NULL) ? mTexture->mD3DResourceView : NULL;
+	dxRenderDevice->mD3DDeviceContext->CSSetShaderResources(mSlot, 1, &srv);
+	if (srv != NULL)
+		dxRenderDevice->mCSBoundSRVs |= 1u << mSlot;
+}
+
+void DXSetComputeUAVCmd::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
+{
+	DXRenderDevice* dxRenderDevice = (DXRenderDevice*)renderDevice;
+	ID3D11UnorderedAccessView* uav = (mTexture != NULL) ? mTexture->GetUAV(mMipLevel) : NULL;
+	UINT initialCount = (UINT)-1;
+	dxRenderDevice->mD3DDeviceContext->CSSetUnorderedAccessViews(mSlot, 1, &uav, &initialCount);
+	if (uav != NULL)
+		dxRenderDevice->mCSBoundUAVs |= 1u << mSlot;
+}
+
+void DXDispatchCmd::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
+{
+	DXRenderDevice* dxRenderDevice = (DXRenderDevice*)renderDevice;
+	auto ctx = dxRenderDevice->mD3DDeviceContext;
+	ctx->CSSetShader(mShader->mD3DComputeShader, NULL, 0);
+	ctx->Dispatch(mGroupsX, mGroupsY, mGroupsZ);
+	ctx->CSSetShader(NULL, NULL, 0);
+
+	// Leave nothing bound: the same resources are typically sampled by the draws that follow.
+	if (dxRenderDevice->mCSBoundUAVs != 0)
+	{
+		ID3D11UnorderedAccessView* nullUAVs[D3D11_PS_CS_UAV_REGISTER_COUNT] = { NULL };
+		UINT counts[D3D11_PS_CS_UAV_REGISTER_COUNT];
+		for (int i = 0; i < D3D11_PS_CS_UAV_REGISTER_COUNT; i++)
+			counts[i] = (UINT)-1;
+		int maxSlot = 0;
+		for (int i = 0; i < D3D11_PS_CS_UAV_REGISTER_COUNT; i++)
+			if ((dxRenderDevice->mCSBoundUAVs & (1u << i)) != 0)
+				maxSlot = i;
+		ctx->CSSetUnorderedAccessViews(0, maxSlot + 1, nullUAVs, counts);
+		dxRenderDevice->mCSBoundUAVs = 0;
+	}
+	if (dxRenderDevice->mCSBoundSRVs != 0)
+	{
+		ID3D11ShaderResourceView* nullSRVs[32] = { NULL };
+		int maxSlot = 0;
+		for (int i = 0; i < 32; i++)
+			if ((dxRenderDevice->mCSBoundSRVs & (1u << i)) != 0)
+				maxSlot = i;
+		ctx->CSSetShaderResources(0, maxSlot + 1, nullSRVs);
+		dxRenderDevice->mCSBoundSRVs = 0;
 	}
 }
 
@@ -1930,7 +2503,7 @@ void DXRenderWindow::ReinitNative()
 	descDepth.Height = mHeight;
 	descDepth.MipLevels = 1;
 	descDepth.ArraySize = 1;
-	descDepth.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+	descDepth.Format = DXGI_FORMAT_D32_FLOAT;
 	descDepth.SampleDesc.Count = msaaSamples;
 	descDepth.SampleDesc.Quality = 0;
 	descDepth.Usage = D3D11_USAGE_DEFAULT;
@@ -1968,7 +2541,8 @@ void DXRenderWindow::PhysSetAsTarget()
 		//mRenderDevice->mD3DDevice->ClearRenderTargetView(mD3DRenderTargetView, D3DXVECTOR4(rand() / (float) RAND_MAX, 0, 1, 0));
 		float bgColor[4] = {0, 0, 0, 0};
 		mDXRenderDevice->mD3DDeviceContext->ClearRenderTargetView(mD3DRenderTargetView, bgColor);
-		mDXRenderDevice->mD3DDeviceContext->ClearDepthStencilView(mD3DDepthStencilView, D3D11_CLEAR_DEPTH/*|D3D11_CLEAR_STENCIL*/, 1.0f, 0);
+		// Reverse-Z: the window's scene depth clears to the far plane at 0.
+		mDXRenderDevice->mD3DDeviceContext->ClearDepthStencilView(mD3DDepthStencilView, D3D11_CLEAR_DEPTH/*|D3D11_CLEAR_STENCIL*/, 0.0f, 0);
 	}
 
 	mHasBeenDrawnTo = true;
@@ -1999,9 +2573,9 @@ void DXRenderWindow::Resized()
 
 	RECT rect;
 	GetClientRect(mHWnd, &rect);
-
-	if (rect.right <= rect.left)
-	{		
+	
+	if ((rect.right <= rect.left) || (rect.bottom <= rect.top))
+	{
 		if (mWidth <= 0)
 		{
 			// Defaults to avoid DX init failure
@@ -2034,14 +2608,14 @@ void DXRenderWindow::Resized()
 		descDepth.Height = mHeight;
 		descDepth.MipLevels = 1;
 		descDepth.ArraySize = 1;
-		descDepth.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+		descDepth.Format = DXGI_FORMAT_D32_FLOAT;
 		descDepth.SampleDesc.Count = msaaSamples;
 		descDepth.SampleDesc.Quality = 0;
 		descDepth.Usage = D3D11_USAGE_DEFAULT;
 		descDepth.BindFlags = D3D11_BIND_DEPTH_STENCIL;
 		descDepth.CPUAccessFlags = 0;
 		descDepth.MiscFlags = 0;
-		mDXRenderDevice->mD3DDevice->CreateTexture2D(&descDepth, NULL, &mD3DDepthBuffer);
+		CheckDXResult(mDXRenderDevice->mD3DDevice->CreateTexture2D(&descDepth, NULL, &mD3DDepthBuffer));
 
 		CheckDXResult(mDXSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&mD3DBackBuffer));
 		CheckDXResult(mDXRenderDevice->mD3DDevice->CreateRenderTargetView(mD3DBackBuffer, NULL, &mD3DRenderTargetView));
@@ -2055,6 +2629,7 @@ void DXRenderWindow::Resized()
 
 void DXRenderWindow::Present()
 {
+	BP_ZONE("DXRenderWindow::Present");
 	// Under external pacing our own vblank must never block the paced loop
 	bool useVSync = (mWindow->mFlags & BFWINDOW_VSYNC) && (gBFApp != NULL) && (!gBFApp->mExternalPacingActive);
 	HRESULT hr = mDXSwapChain->Present(useVSync ? 1 : 0, 0);
@@ -2176,10 +2751,18 @@ bool DXRenderWindow::WaitForVBlank()
 DXRenderDevice::DXRenderDevice()
 {
 	mD3DDevice = NULL;
+	mD3DDeviceContext1 = NULL;
 	mNeedsReinitNative = false;
 	mMatrix2DBuffer = NULL;
 	mCurD3DRTV = NULL;
 	mCurD3DDSV = NULL;
+	mCSBoundSRVs = 0;
+	mCSBoundUAVs = 0;
+	mInstIotaBuffer = NULL;
+	mInstIotaCount = 0;
+	mGpuTimerWriteIdx = 0;
+	mGpuTimerCurTag = 0;
+	mGpuTimerEnabled = false;
 }
 
 DXRenderDevice::~DXRenderDevice()
@@ -2224,6 +2807,8 @@ bool DXRenderDevice::Init(BFApp* app)
 	//flags = D3D11_CREATE_DEVICE_DEBUG;
 	DXCHECK(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, featureLevelArr, 6, D3D11_SDK_VERSION, &mD3DDevice, &d3dFeatureLevel, &mD3DDeviceContext));
 	OutputDebugStrF("D3D Feature Level: %X\n", d3dFeatureLevel);
+	mD3DDeviceContext1 = NULL;
+	mD3DDeviceContext->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&mD3DDeviceContext1);
 
 	IDXGIDevice* pDXGIDevice = NULL;
 	DXCHECK(mD3DDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&pDXGIDevice)));
@@ -2330,6 +2915,19 @@ bool DXRenderDevice::Init(BFApp* app)
 	DXCHECK(mD3DDevice->CreateSamplerState(&sampDesc, &mD3DShadowSamplerState));
 	mD3DDeviceContext->PSSetSamplers(1, 1, &mD3DShadowSamplerState);
 
+	// Trilinear (mip-interpolating) sampler, permanently at slot 2 -- for mipped atlases sampled with
+	// explicit gradients (decals).
+	ZeroMemory(&sampDesc, sizeof(sampDesc));
+	sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+	sampDesc.MinLOD = 0;
+	sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
+	DXCHECK(mD3DDevice->CreateSamplerState(&sampDesc, &mD3DTrilinearSamplerState));
+	mD3DDeviceContext->PSSetSamplers(2, 1, &mD3DTrilinearSamplerState);
+
 	D3D11_BUFFER_DESC bd;
 	bd.Usage = D3D11_USAGE_DYNAMIC;
 	bd.ByteWidth = DX_VTXBUFFER_SIZE;
@@ -2355,10 +2953,176 @@ bool DXRenderDevice::Init(BFApp* app)
 	return true;
 }
 
+DXGpuTimerFrame::DXGpuTimerFrame()
+{
+	mDisjoint = NULL;
+	mSpanCount = 0;
+	mFrameId = 0;
+	mOpen = false;
+	mPending = false;
+}
+
+DXGpuTimerFrame::~DXGpuTimerFrame()
+{
+	ReleaseNative();
+}
+
+void DXGpuTimerFrame::ReleaseNative()
+{
+	if (mDisjoint != NULL)
+		mDisjoint->Release();
+	mDisjoint = NULL;
+	for (auto query : mBeginQueries)
+		query->Release();
+	for (auto query : mEndQueries)
+		query->Release();
+	mBeginQueries.Clear();
+	mEndQueries.Clear();
+	mTags.Clear();
+	mSpanCount = 0;
+	mOpen = false;
+	mPending = false;
+}
+
+void DXRenderDevice::GpuTimerSetEnabled(bool enabled)
+{
+	if (mGpuTimerEnabled == enabled)
+		return;
+	mGpuTimerEnabled = enabled;
+	if (!enabled)
+	{
+		// In-flight frames would never be collected; drop them (and their queries) outright.
+		for (int i = 0; i < DX_GPUTIMER_FRAMES; i++)
+			mGpuTimerFrames[i].ReleaseNative();
+		mGpuTimerWriteIdx = 0;
+	}
+}
+
+ID3D11Query* DXRenderDevice::GetTimestampQuery(Array<ID3D11Query*>& queries, int idx)
+{
+	while ((int)queries.size() <= idx)
+	{
+		D3D11_QUERY_DESC desc = { D3D11_QUERY_TIMESTAMP, 0 };
+		ID3D11Query* query = NULL;
+		if (FAILED(mD3DDevice->CreateQuery(&desc, &query)))
+			return NULL;
+		queries.push_back(query);
+	}
+	return queries[idx];
+}
+
+bool DXRenderDevice::GpuTimerBeginFrame(int64 frameId)
+{
+	if (!mGpuTimerEnabled)
+		return false;
+	DXGpuTimerFrame& frame = mGpuTimerFrames[mGpuTimerWriteIdx];
+	if (frame.mPending)
+		return false; // the ring is full of frames the GPU hasn't finished -- skip timing this one
+	if (frame.mDisjoint == NULL)
+	{
+		D3D11_QUERY_DESC desc = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+		if (FAILED(mD3DDevice->CreateQuery(&desc, &frame.mDisjoint)))
+			return false;
+	}
+	frame.mFrameId = frameId;
+	frame.mSpanCount = 0;
+	frame.mOpen = true;
+	mD3DDeviceContext->Begin(frame.mDisjoint);
+	return true;
+}
+
+void DXRenderDevice::GpuTimerSetTag(int tag)
+{
+	mGpuTimerCurTag = tag;
+}
+
+int DXRenderDevice::GpuTimerSpanBegin()
+{
+	if (!mGpuTimerEnabled)
+		return -1;
+	DXGpuTimerFrame& frame = mGpuTimerFrames[mGpuTimerWriteIdx];
+	if ((!frame.mOpen) || (frame.mSpanCount >= DX_GPUTIMER_MAX_SPANS))
+		return -1;
+	int idx = frame.mSpanCount;
+	ID3D11Query* beginQuery = GetTimestampQuery(frame.mBeginQueries, idx);
+	if ((beginQuery == NULL) || (GetTimestampQuery(frame.mEndQueries, idx) == NULL))
+		return -1;
+	while ((int)frame.mTags.size() <= idx)
+		frame.mTags.push_back(0);
+	frame.mTags[idx] = mGpuTimerCurTag;
+	frame.mSpanCount = idx + 1;
+	mD3DDeviceContext->End(beginQuery);
+	return idx;
+}
+
+void DXRenderDevice::GpuTimerSpanEnd(int spanId)
+{
+	DXGpuTimerFrame& frame = mGpuTimerFrames[mGpuTimerWriteIdx];
+	if ((!frame.mOpen) || (spanId < 0) || (spanId >= (int)frame.mEndQueries.size()))
+		return;
+	mD3DDeviceContext->End(frame.mEndQueries[spanId]);
+}
+
+void DXRenderDevice::GpuTimerEndFrame()
+{
+	DXGpuTimerFrame& frame = mGpuTimerFrames[mGpuTimerWriteIdx];
+	if (!frame.mOpen)
+		return;
+	mD3DDeviceContext->End(frame.mDisjoint);
+	frame.mOpen = false;
+	frame.mPending = true;
+	mGpuTimerWriteIdx = (mGpuTimerWriteIdx + 1) % DX_GPUTIMER_FRAMES;
+}
+
+int DXRenderDevice::GpuTimerFetch(int64* outFrameId, GpuTimerSpan* outSpans, int maxSpans)
+{
+	// Oldest first, so results come back in frame order.
+	for (int i = 1; i <= DX_GPUTIMER_FRAMES; i++)
+	{
+		DXGpuTimerFrame& frame = mGpuTimerFrames[(mGpuTimerWriteIdx + i) % DX_GPUTIMER_FRAMES];
+		if (!frame.mPending)
+			continue;
+
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
+		HRESULT hr = mD3DDeviceContext->GetData(frame.mDisjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+		if (hr != S_OK)
+			return -1; // not ready; a later frame can't be ready before this one either
+
+		frame.mPending = false;
+		*outFrameId = frame.mFrameId;
+		if ((disjoint.Disjoint) || (disjoint.Frequency == 0))
+			return 0; // the clock jumped (power state change) -- this frame's timings are meaningless
+
+		int count = 0;
+		for (int spanIdx = 0; (spanIdx < frame.mSpanCount) && (count < maxSpans); spanIdx++)
+		{
+			uint64 beginTick = 0;
+			uint64 endTick = 0;
+			if (mD3DDeviceContext->GetData(frame.mBeginQueries[spanIdx], &beginTick, sizeof(beginTick), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+				continue;
+			if (mD3DDeviceContext->GetData(frame.mEndQueries[spanIdx], &endTick, sizeof(endTick), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+				continue;
+			if (endTick <= beginTick)
+				continue;
+			outSpans[count].mTag = frame.mTags[spanIdx];
+			outSpans[count].mNanos = (int64)((endTick - beginTick) * 1000000000ULL / disjoint.Frequency);
+			count++;
+		}
+		return count;
+	}
+	return -1;
+}
+
 void DXRenderDevice::ReleaseNative()
 {
+	for (int i = 0; i < DX_GPUTIMER_FRAMES; i++)
+		mGpuTimerFrames[i].ReleaseNative();
 	mD3DVertexBuffer->Release();
 	mD3DVertexBuffer = NULL;
+	if (mInstIotaBuffer != NULL)
+		mInstIotaBuffer->Release();
+	mInstIotaBuffer = NULL;
+	mInstIotaCount = 0;
 	if (mMatrix2DBuffer != NULL)
 		mMatrix2DBuffer->Release();
 	mMatrix2DBuffer = NULL;
@@ -2374,6 +3138,11 @@ void DXRenderDevice::ReleaseNative()
 	mD3DNearestSamplerState = NULL;
 	mD3DShadowSamplerState->Release();
 	mD3DShadowSamplerState = NULL;
+	mD3DTrilinearSamplerState->Release();
+	mD3DTrilinearSamplerState = NULL;
+	if (mD3DDeviceContext1 != NULL)
+		mD3DDeviceContext1->Release();
+	mD3DDeviceContext1 = NULL;
 	mD3DDeviceContext->Release();
 	mD3DDeviceContext = NULL;
 
@@ -2480,6 +3249,10 @@ Texture* DXRenderDevice::LoadTexture(const StringImpl& fileName, int flags)
 	String pathEx = fileName;
 	if ((flags & TextureFlag_Additive) != 0)
 		pathEx += ":add";
+	if ((flags & TextureFlag_Mipmaps) != 0)
+		pathEx += ":mip";
+	if ((flags & TextureFlag_Srgb) != 0)
+		pathEx += ":srgb";
 
 	DXTexture* aTexture = NULL;
 	if ((!fileName.StartsWith('@')) && (mTextureMap.TryGetValue(pathEx, &aTexture)))
@@ -2642,6 +3415,7 @@ Texture* DXRenderDevice::LoadTexture(ImageData* imageData, int flags)
 		imageData->PremultiplyAlpha();
 
 	bool wantMipmaps = (flags & TextureFlag_Mipmaps) != 0;
+	bool wantSrgb = (flags & TextureFlag_Srgb) != 0;
 
 	int aWidth = imageData->mWidth;
 	int aHeight = imageData->mHeight;
@@ -2652,7 +3426,10 @@ Texture* DXRenderDevice::LoadTexture(ImageData* imageData, int flags)
 	desc.Width = aWidth;
 	desc.Height = aHeight;
 	desc.ArraySize = 1;
-	desc.Format = ((flags & TextureFlag_Srgb) != 0) ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+	// sRGB content is stored TYPELESS so CreateRawRef can alias a second _UNORM view over the same
+	// resource later; a fully-typed resource only accepts views of its own format. Costs nothing --
+	// the memory and the sampling path are identical. Non-sRGB textures stay exactly as they were.
+	desc.Format = wantSrgb ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM;
 	desc.SampleDesc.Count = 1;
 	desc.Usage = D3D11_USAGE_DEFAULT;
 	desc.CPUAccessFlags = 0;
@@ -2686,7 +3463,9 @@ Texture* DXRenderDevice::LoadTexture(ImageData* imageData, int flags)
 	}
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC srDesc;
-	srDesc.Format = desc.Format;
+	// A TYPELESS resource can't be viewed as-is; sRGB content gets the decoding view here, which is
+	// also what GenerateMips wants so the filtering below happens in linear space.
+	srDesc.Format = wantSrgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : desc.Format;
 	srDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 	srDesc.Texture2D.MostDetailedMip = 0;
 	srDesc.Texture2D.MipLevels = wantMipmaps ? -1 : 1;
@@ -2705,6 +3484,7 @@ Texture* DXRenderDevice::LoadTexture(ImageData* imageData, int flags)
 	aTexture->mWidth = aWidth;
 	aTexture->mHeight = aHeight;
 	aTexture->mD3DTexture = d3DTexture;
+	aTexture->mD3DFormat = desc.Format;
 	aTexture->mD3DResourceView = d3DShaderResourceView;
 	aTexture->AddRef();
 
@@ -2782,6 +3562,27 @@ void DXRenderDevice::ReleaseShader(Shader* shader)
 	delete shader;
 }
 
+ComputeShader* DXRenderDevice::LoadComputeShader(const StringImpl& fileName, const StringImpl& entry)
+{
+	DXComputeShader* shader = new DXComputeShader();
+	shader->mRenderDevice = this;
+	shader->mSrcPath = fileName;
+	shader->mEntry = entry;
+	if (!shader->Load())
+	{
+		shader->mRenderDevice = NULL;
+		delete shader;
+		return NULL;
+	}
+	mComputeShaders.Add(shader);
+	return shader;
+}
+
+void DXRenderDevice::ReleaseComputeShader(ComputeShader* shader)
+{
+	delete shader;
+}
+
 void DXRenderDevice::SetRenderState(RenderState* renderState)
 {
 	mCurRenderState = renderState;
@@ -2793,16 +3594,24 @@ Texture* DXRenderDevice::CreateRenderTarget(int width, int height, int flags, in
 	bool makeShared = (flags & 2) != 0;
 	bool highPrecision = (flags & 4) != 0;
 	bool r8 = (flags & 8) != 0;
-	bool f16 = (flags & 16) != 0;
+	bool f16 = (flags & 0x10) != 0;
+	bool mipmaps = (flags & 0x20) != 0;
+	bool rg8 = (flags & 0x40) != 0;
+	bool r16f = (flags & 0x80) != 0;
+	bool r32u = (flags & 0x100) != 0;
+	bool unorderedAccess = (flags & 0x200) != 0;
 
 	// D3D11 shared resources can't be multisampled -- render into a private MSAA target and
 	// ResolveTo a shared one instead.
 	BF_ASSERT(!(makeShared && (sampleCount > 1)));
+	BF_ASSERT(!(mipmaps && ((sampleCount > 1) || makeShared)));
+	BF_ASSERT(!(unorderedAccess && ((sampleCount > 1) || makeShared)));
 
 	ID3D11ShaderResourceView* d3DShaderResourceView = NULL;
 
 	DXGI_FORMAT format = highPrecision ? DXGI_FORMAT_R32_FLOAT : r8 ? DXGI_FORMAT_R8_UNORM :
-		f16 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+		f16 ? DXGI_FORMAT_R16G16B16A16_FLOAT : rg8 ? DXGI_FORMAT_R8G8_UNORM :
+		r16f ? DXGI_FORMAT_R16_FLOAT : r32u ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
 	int samples = ValidateSampleCount(mD3DDevice, format, sampleCount);
 
 	// Create the render target texture
@@ -2810,7 +3619,7 @@ Texture* DXRenderDevice::CreateRenderTarget(int width, int height, int flags, in
 	ZeroMemory(&desc, sizeof(desc));
 	desc.Width = width;
 	desc.Height = height;
-	desc.MipLevels = 1;
+	desc.MipLevels = mipmaps ? 0 : 1; // 0 = full chain, filled on demand by GenerateMips
 	desc.ArraySize = 1;
 	desc.Format = format;
 	desc.SampleDesc.Count = samples;
@@ -2819,9 +3628,13 @@ Texture* DXRenderDevice::CreateRenderTarget(int width, int height, int flags, in
 	desc.Usage = D3D11_USAGE_DEFAULT;
 	desc.CPUAccessFlags = 0; //D3D11_CPU_ACCESS_WRITE;
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	if (unorderedAccess)
+		desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
 
 	if (makeShared)
 		desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+	if (mipmaps)
+		desc.MiscFlags |= D3D11_RESOURCE_MISC_GENERATE_MIPS;
 
 	ID3D11Texture2D* d3DTexture = NULL;
 	DXCHECK(mD3DDevice->CreateTexture2D(&desc, NULL, &d3DTexture));
@@ -2830,7 +3643,7 @@ Texture* DXRenderDevice::CreateRenderTarget(int width, int height, int flags, in
 	srDesc.Format = desc.Format;
 	srDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 	srDesc.Texture2D.MostDetailedMip = 0;
-	srDesc.Texture2D.MipLevels = 1;
+	srDesc.Texture2D.MipLevels = mipmaps ? -1 : 1;
 
 	// An MSAA texture can't be sampled as a plain Texture2D -- callers never should (ResolveTo a
 	// single-sample target first), but the view still has to be creatable.
@@ -2855,6 +3668,8 @@ Texture* DXRenderDevice::CreateRenderTarget(int width, int height, int flags, in
 	aRenderTarget->mSampleCount = samples;
 	if (makeShared)
 		d3DTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&aRenderTarget->mD3DKeyedMutex);
+	if (unorderedAccess)
+		DXCHECK(mD3DDevice->CreateUnorderedAccessView(d3DTexture, NULL, &aRenderTarget->mD3DUAV));
 	aRenderTarget->AddRef();
 
 	// Typeless so GetDepthBits can staging-copy it and CreateDepthRef can view it; stencil is
@@ -2895,6 +3710,7 @@ Texture* DXRenderDevice::CreateDepthTarget(int width, int height, bool is16Bit)
 	aRenderTarget->mHeight = height;
 	aRenderTarget->mRenderDevice = this;
 	aRenderTarget->mD3DFormat = is16Bit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R32_FLOAT;
+	aRenderTarget->mStandardDepthClear = true;
 	aRenderTarget->AddRef();
 
 	D3D11_TEXTURE2D_DESC descDepth;
@@ -2927,6 +3743,129 @@ Texture* DXRenderDevice::CreateDepthTarget(int width, int height, bool is16Bit)
 	DXCHECK(mD3DDevice->CreateShaderResourceView(aRenderTarget->mD3DDepthBuffer, &srDesc, &aRenderTarget->mD3DResourceView));
 
 	return aRenderTarget;
+}
+
+Texture* DXRenderDevice::CreateStructuredBuffer(int stride, int count, int flags)
+{
+	BF_ASSERT((stride > 0) && (stride % 4 == 0) && (count > 0));
+	bool gpuWritable = (flags & 1) != 0;
+	bool defaultUsage = gpuWritable || ((flags & 2) != 0);
+
+	DXStructuredBuffer* buffer = new DXStructuredBuffer();
+	buffer->mWidth = count;
+	buffer->mHeight = 1;
+	buffer->mStride = stride;
+	buffer->mGpuWritable = gpuWritable;
+	buffer->mDefaultUsage = defaultUsage;
+	buffer->mRenderDevice = this;
+	buffer->AddRef();
+
+	D3D11_BUFFER_DESC desc;
+	ZeroMemory(&desc, sizeof(desc));
+	desc.Usage = defaultUsage ? D3D11_USAGE_DEFAULT : D3D11_USAGE_DYNAMIC;
+	desc.ByteWidth = stride * count;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (gpuWritable ? D3D11_BIND_UNORDERED_ACCESS : 0);
+	desc.CPUAccessFlags = defaultUsage ? 0 : D3D11_CPU_ACCESS_WRITE;
+	desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+	desc.StructureByteStride = stride;
+	DXCHECK(mD3DDevice->CreateBuffer(&desc, NULL, &buffer->mD3DBuffer));
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srDesc;
+	ZeroMemory(&srDesc, sizeof(srDesc));
+	srDesc.Format = DXGI_FORMAT_UNKNOWN;
+	srDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+	srDesc.Buffer.FirstElement = 0;
+	srDesc.Buffer.NumElements = count;
+	DXCHECK(mD3DDevice->CreateShaderResourceView(buffer->mD3DBuffer, &srDesc, &buffer->mD3DResourceView));
+
+	if (gpuWritable)
+	{
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc;
+		ZeroMemory(&uavDesc, sizeof(uavDesc));
+		uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		uavDesc.Buffer.FirstElement = 0;
+		uavDesc.Buffer.NumElements = count;
+		DXCHECK(mD3DDevice->CreateUnorderedAccessView(buffer->mD3DBuffer, &uavDesc, &buffer->mD3DUAV));
+	}
+
+	return buffer;
+}
+
+// Format flags as CreateRenderTarget (4 R32F, 8 R8, 0x10 RGBA16F, 0x40 RG8, 0x80 R16F, 0x100 R32_UINT,
+// else RGBA8); 0x20 = full mip chain (GenerateMips-able, so also render-target bindable).
+Texture* DXRenderDevice::CreateTexture3D(int width, int height, int depth, int flags)
+{
+	BF_ASSERT((width > 0) && (height > 0) && (depth > 0));
+	bool highPrecision = (flags & 4) != 0;
+	bool r8 = (flags & 8) != 0;
+	bool f16 = (flags & 0x10) != 0;
+	bool mipmaps = (flags & 0x20) != 0;
+	bool rg8 = (flags & 0x40) != 0;
+	bool r16f = (flags & 0x80) != 0;
+	bool r32u = (flags & 0x100) != 0;
+	BF_ASSERT(!(mipmaps && r32u)); // integer formats can't be mip-filtered
+
+	DXGI_FORMAT format = highPrecision ? DXGI_FORMAT_R32_FLOAT : r8 ? DXGI_FORMAT_R8_UNORM :
+		f16 ? DXGI_FORMAT_R16G16B16A16_FLOAT : rg8 ? DXGI_FORMAT_R8G8_UNORM :
+		r16f ? DXGI_FORMAT_R16_FLOAT : r32u ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
+	int bytesPerTexel = highPrecision ? 4 : r8 ? 1 : f16 ? 8 : rg8 ? 2 : r16f ? 2 : r32u ? 4 : 4;
+
+	int mipLevels = 1;
+	if (mipmaps)
+	{
+		int size = BF_MAX(BF_MAX(width, height), depth);
+		while (((size >> mipLevels) >= 1) && (mipLevels < DXTexture3D::cMaxMips))
+			mipLevels++;
+	}
+
+	D3D11_TEXTURE3D_DESC desc;
+	ZeroMemory(&desc, sizeof(desc));
+	desc.Width = width;
+	desc.Height = height;
+	desc.Depth = depth;
+	desc.MipLevels = mipLevels;
+	desc.Format = format;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	if (mipmaps)
+	{
+		desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+		desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+	}
+
+	DXTexture3D* tex = new DXTexture3D();
+	tex->mWidth = width;
+	tex->mHeight = height;
+	tex->mDepth = depth;
+	tex->mMipLevels = mipLevels;
+	tex->mBytesPerTexel = bytesPerTexel;
+	tex->mD3DFormat = format;
+	tex->mRenderDevice = this;
+	tex->AddRef();
+	DXCHECK(mD3DDevice->CreateTexture3D(&desc, NULL, &tex->mD3DTexture3D));
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srDesc;
+	ZeroMemory(&srDesc, sizeof(srDesc));
+	srDesc.Format = format;
+	srDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+	srDesc.Texture3D.MostDetailedMip = 0;
+	srDesc.Texture3D.MipLevels = mipLevels;
+	DXCHECK(mD3DDevice->CreateShaderResourceView(tex->mD3DTexture3D, &srDesc, &tex->mD3DResourceView));
+
+	for (int mip = 0; mip < mipLevels; mip++)
+	{
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc;
+		ZeroMemory(&uavDesc, sizeof(uavDesc));
+		uavDesc.Format = format;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D;
+		uavDesc.Texture3D.MipSlice = mip;
+		uavDesc.Texture3D.FirstWSlice = 0;
+		uavDesc.Texture3D.WSize = -1;
+		DXCHECK(mD3DDevice->CreateUnorderedAccessView(tex->mD3DTexture3D, &uavDesc, &tex->mD3DUAVs[mip]));
+	}
+
+	return tex;
 }
 
 Texture* DXRenderDevice::OpenSharedRenderTarget(void* handle, int width, int height)
@@ -2970,7 +3909,7 @@ Texture* DXRenderDevice::OpenSharedRenderTarget(void* handle, int width, int hei
 	descDepth.MipLevels = 1;
 	descDepth.ArraySize = 1;
 	descDepth.SampleDesc.Quality = sampleQuality;
-	descDepth.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+	descDepth.Format = DXGI_FORMAT_D32_FLOAT;
 	descDepth.SampleDesc.Count = 1;
 	descDepth.SampleDesc.Quality = 0;
 	descDepth.Usage = D3D11_USAGE_DEFAULT;
