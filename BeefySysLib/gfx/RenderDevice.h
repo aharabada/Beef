@@ -174,7 +174,8 @@ enum TextureFlag : int8
 	TextureFlag_HasTransFollowing = 8,
 	TextureFlag_Mipmaps = 0x10,
 	// Color data: store sRGB-encoded, sample hardware-decoded to linear.
-	TextureFlag_Srgb = 0x20
+	TextureFlag_Srgb = 0x20,
+	TextureFlag_UseLoadCache = 0x40
 };
 
 struct VertexDefData
@@ -260,6 +261,7 @@ public:
 	bool					mDisablePixelShader;
 	bool					mDisableRenderTarget;
 	bool					mDisableBlend;
+	bool					mAlphaToCoverage;
 
 public:
 	RenderState();
@@ -278,6 +280,7 @@ public:
 	virtual void SetDisablePixelShader(bool disable) { mDisablePixelShader = disable; }
 	virtual void SetDisableRenderTarget(bool disable) { mDisableRenderTarget = disable; }
 	virtual void SetDisableBlend(bool disable) { mDisableBlend = disable; }
+	virtual void SetAlphaToCoverage(bool enabled) { mAlphaToCoverage = enabled; }
 };
 
 class PoolData
@@ -329,10 +332,15 @@ enum ModelCreateFlags
 	ModelCreateFlags_NoSetRenderState = 1
 };
 
+// Search directories for shader #include resolution, tried after the including file's own
+// directory. The shader cache's include hash walk uses the same list.
+void AddShaderIncludeDir(const StringImpl& dir);
+const Array<String>& GetShaderIncludeDirs();
+
 class RenderDevice
 {
-public:	
-	Array<DrawBatch*>		mDrawBatchPool;	
+public:
+	Array<DrawBatch*>		mDrawBatchPool;
 	
 	BFApp*					mApp;
 	RenderWindow*			mPhysRenderWindow;
@@ -403,7 +411,9 @@ public:
 	virtual Texture*		CreateTexture3D(int width, int height, int depth, int flags) { return NULL; }
 	virtual Texture*		OpenSharedRenderTarget(void* handle, int width, int height) { return NULL; }
 	
-	virtual Shader*			LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition) = 0;
+	// entrySuffix compiles alternate entry points ("VS"+suffix / "PS"+suffix) from the same file --
+	// how one surface-shader source yields its per-pass variants.
+	virtual Shader*			LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition, const StringImpl& entrySuffix) = 0;
 	virtual void			ReleaseShader(Shader* shader);
 	virtual ComputeShader*	LoadComputeShader(const StringImpl& fileName, const StringImpl& entry) { return NULL; }
 	virtual void			ReleaseComputeShader(ComputeShader* shader);

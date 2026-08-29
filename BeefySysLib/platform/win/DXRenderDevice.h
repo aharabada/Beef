@@ -82,6 +82,7 @@ public:
 
 	virtual ID3D11UnorderedAccessView* GetUAV(int mipLevel) { return (mipLevel == 0) ? mD3DUAV : NULL; }
 
+	virtual void			Release() override;
 	virtual void			PhysSetAsTarget() override;
 	virtual void			Blt(ImageData* imageData, int x, int y) override;
 	virtual void			SetBits(int destX, int destY, int destWidth, int destHeight, int srcPitch, uint32* bits) override;
@@ -108,7 +109,16 @@ public:
 	ID3D11Buffer*			mD3DStaging;
 	int						mStride;
 	bool					mGpuWritable;
-	bool					mDefaultUsage; // GPU-writable or CPU-updatable: written with UpdateSubresource, never mapped
+	bool					mDefaultUsage;
+	bool					mStreaming;
+	ID3D11Buffer*			mD3DUpdateStaging[3];
+	int						mUpdateStagingIdx;
+	// Batched upload: one DISCARD-mapped dynamic buffer per flush, scattered writes, then one
+	// CopySubresourceRegion per dirty range (see UpdateBufferRange / FlushUpdates).
+	ID3D11Buffer*			mD3DUploadBuffer;
+	void*					mUploadPtr;
+	std::vector<int>		mPendingRanges;
+	virtual void			FlushBufferUpdates() override; // GPU-writable or CPU-updatable: written with UpdateSubresource, never mapped
 
 public:
 	DXStructuredBuffer();
@@ -179,6 +189,7 @@ class DXShader : public Shader
 public:
 	DXRenderDevice*			mRenderDevice;
 	String					mSrcPath;
+	String					mEntrySuffix; // "" = the plain VS/PS entries
 	VertexDefinition*		mVertexDef;
 
 	ID3D11InputLayout*		mD3DLayout;
@@ -474,11 +485,15 @@ public:
 class DXRenderDevice : public RenderDevice
 {
 public:
+	ID3D11InfoQueue*		mD3DInfoQueue;
+	Texture*				mPSBoundTextures[32];
+	void					DrainDebugMessages();
 	IDXGIFactory*			mDXGIFactory;
 	ID3D11Device*			mD3DDevice;
 	ID3D11DeviceContext*	mD3DDeviceContext;
 	ID3D11DeviceContext1*	mD3DDeviceContext1; // 11.1 interface for rect clears; NULL on 11.0 runtimes
 	ID3D11BlendState*		mD3DNormalBlendState;
+	ID3D11BlendState*		mD3DA2CBlendState;
 	ID3D11SamplerState*		mD3DDefaultSamplerState;
 	ID3D11SamplerState*		mD3DWrapSamplerState;
 	ID3D11SamplerState*		mD3DNearestSamplerState;
@@ -510,6 +525,9 @@ public:
 	HashSet<DXComputeShader*> mComputeShaders;
 	Dictionary<String, DXTexture*> mTextureMap;
 	Dictionary<int, ID3D11Buffer*> mBufferMap;
+	// Refcount-zero textures wait here until FrameEnd has flushed every layer: queued draw
+	// commands may still reference them (the texture analog of Scene's retired GpuBuffers).
+	Array<DXTexture*>		mRetiredTextures;
 	// Compute slots bound since the last dispatch (bit per slot); the dispatch unbinds them.
 	uint32					mCSBoundSRVs;
 	uint32					mCSBoundUAVs;
@@ -543,11 +561,13 @@ public:
 
 	void					FrameStart() override;
 	void					FrameEnd() override;
+	void					RetireTexture(DXTexture* texture);
+	void					ProcessRetiredTextures();
 
 	Texture*				LoadTexture(const StringImpl& fileName, int flags) override;
 	Texture*				LoadTexture(ImageData* imageData, int flags) override;
 	Texture*				CreateDynTexture(int width, int height) override;
-	Shader*					LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition) override;
+	Shader*					LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition, const StringImpl& entrySuffix) override;
 	void					ReleaseShader(Shader* shader) override;
 	Texture*				CreateRenderTarget(int width, int height, int flags, int sampleCount) override;
 	Texture*				CreateDepthTarget(int width, int height, bool is16Bit) override;

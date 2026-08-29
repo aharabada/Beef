@@ -435,6 +435,7 @@ enum CeFunctionKind
 	CeFunctionKind_GetReflectNextTypeDecl,
 	CeFunctionKind_GetBaseType,
 	CeFunctionKind_HasDeclaredMember,
+	CeFunctionKind_Type_GetMethodDeclarationText,
 	CeFunctionKind_GetReflectType,
 	CeFunctionKind_GetReflectTypeById,
 	CeFunctionKind_GetWrappedType,
@@ -534,6 +535,10 @@ enum CeFunctionKind
 	CeFunctionKind_Double_Ftoa,
 	CeFunctionKind_Double_ToString,
 	CeFunctionKind_Float_ToString,
+	CeFunctionKind_Double_ToString_RoundTripFast,
+	CeFunctionKind_Float_ToString_RoundTripFast,
+	CeFunctionKind_Double_Parse,
+	CeFunctionKind_Float_Parse,
 
 	CeFunctionKind_Math_Abs,
 	CeFunctionKind_Math_Acos,

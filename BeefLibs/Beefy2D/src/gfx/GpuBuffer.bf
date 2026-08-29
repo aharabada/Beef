@@ -21,17 +21,23 @@ namespace Beefy.gfx
 		[CallingConvention(.Stdcall), CLink]
 		static extern void Gfx_Buffer_UpdateRange(void* textureSegment, int32 offset, void* data, int32 size);
 
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Buffer_FlushUpdates(void* textureSegment);
+
 		public int32 mStride;
 		public int32 mCount;
 		public bool mGpuWritable;
 		public bool mCpuUpdatable;
+		public bool mStreaming;
 
 		public int ByteSize => mStride * mCount;
 
 		// cpuUpdatable = default usage the CPU writes in place with UpdateRange (immediately, not queued).
-		public static GpuBuffer Create(int32 stride, int32 count, bool gpuWritable = false, bool cpuUpdatable = false)
+		// streaming = an append-only per-frame stream: UpdateRange at offset 0 discards the buffer,
+		// later ranges append; never rewrite a range within a frame.
+		public static GpuBuffer Create(int32 stride, int32 count, bool gpuWritable = false, bool cpuUpdatable = false, bool streaming = false)
 		{
-			void* seg = Gfx_CreateStructuredBuffer(stride, count, (gpuWritable ? 1 : 0) | (cpuUpdatable ? 2 : 0));
+			void* seg = Gfx_CreateStructuredBuffer(stride, count, (gpuWritable ? 1 : 0) | (cpuUpdatable ? 2 : 0) | (streaming ? 4 : 0));
 			if (seg == null)
 				return null;
 			GpuBuffer buffer = new GpuBuffer();
@@ -40,6 +46,7 @@ namespace Beefy.gfx
 			buffer.mCount = count;
 			buffer.mGpuWritable = gpuWritable;
 			buffer.mCpuUpdatable = cpuUpdatable;
+			buffer.mStreaming = streaming;
 			buffer.mSrcWidth = count;
 			buffer.mSrcHeight = 1;
 			buffer.mWidth = count;
@@ -47,7 +54,7 @@ namespace Beefy.gfx
 			return buffer;
 		}
 
-		public static GpuBuffer Create<T>(int32 count, bool gpuWritable = false, bool cpuUpdatable = false) where T : struct => Create((int32)sizeof(T), count, gpuWritable, cpuUpdatable);
+		public static GpuBuffer Create<T>(int32 count, bool gpuWritable = false, bool cpuUpdatable = false, bool streaming = false) where T : struct => Create((int32)sizeof(T), count, gpuWritable, cpuUpdatable, streaming);
 
 		public void SetData(void* data, int size)
 		{
@@ -64,9 +71,17 @@ namespace Beefy.gfx
 		// queued in any draw layer, so a pass can publish what its already-queued draws will read.
 		public void UpdateRange(int offset, void* data, int size)
 		{
-			Debug.Assert(mCpuUpdatable);
+			Debug.Assert(mCpuUpdatable || mStreaming);
 			Debug.Assert((offset >= 0) && (size > 0) && (offset + size <= ByteSize));
 			Gfx_Buffer_UpdateRange(mNativeTextureSegment, (.)offset, data, (.)size);
+		}
+
+		// Lands every range UpdateRange accumulated since the last call, as GPU-queue copies. Call
+		// after a batch of updates and before anything reads the buffer -- unflushed writes are
+		// simply not there yet.
+		public void FlushUpdates()
+		{
+			Gfx_Buffer_FlushUpdates(mNativeTextureSegment);
 		}
 
 		// Immediate readback of what the GPU has finished -- draw the layer that wrote it first.

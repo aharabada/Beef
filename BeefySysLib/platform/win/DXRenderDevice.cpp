@@ -4,6 +4,7 @@
 
 #include "Common.h"
 #include "DXRenderDevice.h"
+#include <dxgi1_6.h>
 #include "BFWindow.h"
 #include "img/ImageData.h"
 #include "util/PerfTimer.h"
@@ -12,6 +13,8 @@
 #include "Span.h"
 #include "FileStream.h"
 #include "DDS.h"
+#include <map>
+#include <set>
 
 using namespace DirectX;
 
@@ -41,6 +44,81 @@ USING_NS_BF;
 //#pragma comment(lib, "d3dx11.lib")
 #pragma comment(lib, "d2d1.lib")
 //#pragma comment(lib, "dxerr.lib")
+
+// ============================================================================
+// Runtime debug flags (env-var gated), added during the 2026-08 Intel Arc rendering-corruption
+// investigation -- see docs/d3d-compatibility.md for the full story. Uncomment the #define below to
+// compile these in; leave it commented out for a normal build. Compiled OUT (the default), each
+// flag below is a literal `false` and every getenv() call in this file disappears entirely -- a
+// shipping build pays nothing for this, not even the call. Compiled IN, each flag is still off
+// unless its specific environment variable is set, so normal local runs are unaffected either way;
+// the define just makes the checks exist at all, for whoever is actively driver-hunting.
+//
+// Do not enable this in anything that ships.
+//#define ENABLE_RUNTIME_DEBUG_FLAGS
+
+#if defined(ENABLE_RUNTIME_DEBUG_FLAGS)
+
+// BRISK_D3D_DEBUG: create the D3D11 device with D3D11_CREATE_DEVICE_DEBUG. Routes the runtime
+// validation layer's messages through DXRenderDevice::DrainDebugMessages(), printed once per
+// Present as "D3DDBG ...". Needs the Windows "Graphics Tools" optional feature installed; falls
+// back to a non-debug device if it's missing. Use this to check whether a change introduces any
+// D3D11-illegal usage -- see tests/regressions/d3d_validation.py, which runs the exe with this on
+// and fails the build on any message at all.
+#define BRISK_DBG_WANT_D3D_DEBUG() (getenv("BRISK_D3D_DEBUG") != NULL)
+
+// BRISK_FORCE_IGPU: pick the DXGI_GPU_PREFERENCE_MINIMUM_POWER adapter instead of
+// HIGH_PERFORMANCE at device creation -- i.e. deliberately render on a laptop's slower
+// integrated/lower-power GPU instead of its discrete one. This is how the Arc investigation ran
+// the engine on the Intel iGPU of a hybrid-GPU machine that would otherwise always pick the
+// NVIDIA discrete GPU.
+#define BRISK_DBG_FORCE_IGPU() (getenv("BRISK_FORCE_IGPU") != NULL)
+
+// BRISK_VSYNC: force Present() to wait for vblank even if the window wasn't created with
+// BFWINDOW_VSYNC. Used to test whether a rendering artifact is specifically a Present/scanout-
+// timing issue (classic tearing) as opposed to corruption that happens earlier, during scene
+// rendering -- forcing vsync did NOT fix the Arc corruption, which helped rule that out.
+#define BRISK_DBG_FORCE_VSYNC() (getenv("BRISK_VSYNC") != NULL)
+
+// BRISK_UPDATE_LEGACY: make DXStructuredBuffer::UpdateBufferRange use a raw, boxed
+// UpdateSubresource instead of the normal batched-copy path. THIS IS THE KNOWN-BAD PATTERN: a
+// boxed UpdateSubresource on a buffer with in-flight GPU reads corrupted what those reads fetched
+// on Intel Arc drivers predating 2026-08 (see docs/d3d-compatibility.md). Kept so a future "is
+// this GPU/driver still affected" check is a one-line env var instead of reverting code. Never
+// set this outside a deliberate driver-regression test.
+#define BRISK_DBG_UPDATE_LEGACY() (getenv("BRISK_UPDATE_LEGACY") != NULL)
+
+// BRISK_UPDATE_UNBATCHED: make DXStructuredBuffer::UpdateBufferRange copy each dirty range
+// through its own staging buffer immediately, instead of accumulating ranges into one
+// DISCARD-mapped upload buffer and copying them all at FlushBufferUpdates. Safe (unlike
+// BRISK_UPDATE_LEGACY), just slower under heavy dirty-range churn. Use to tell whether a symptom
+// is about SAFETY (compare against BRISK_UPDATE_LEGACY) or PERFORMANCE (compare against the
+// default batched path) of the buffer-update code.
+#define BRISK_DBG_UPDATE_UNBATCHED() (getenv("BRISK_UPDATE_UNBATCHED") != NULL)
+
+#else // !ENABLE_RUNTIME_DEBUG_FLAGS -- each flag is a compile-time false; no getenv() call exists.
+
+#define BRISK_DBG_WANT_D3D_DEBUG() (false)
+#define BRISK_DBG_FORCE_IGPU() (false)
+#define BRISK_DBG_FORCE_VSYNC() (false)
+#define BRISK_DBG_UPDATE_LEGACY() (false)
+#define BRISK_DBG_UPDATE_UNBATCHED() (false)
+
+#endif // ENABLE_RUNTIME_DEBUG_FLAGS
+
+// Always compiled, regardless of ENABLE_RUNTIME_DEBUG_FLAGS -- lets a caller (or a test harness)
+// tell "the flags are compiled out" apart from "compiled in, but nothing found anything to report"
+// instead of silently treating both the same way. See tests/regressions/d3d_validation.py, which
+// would otherwise report a false PASS if BRISK_D3D_DEBUG=1 silently did nothing.
+BF_EXPORT bool BF_CALLTYPE Gfx_RuntimeDebugFlagsCompiledIn()
+{
+#if defined(ENABLE_RUNTIME_DEBUG_FLAGS)
+	return true;
+#else
+	return false;
+#endif
+}
+// ============================================================================
 #pragma comment(lib, "dxgi.lib")
 //#pragma comment(lib, "D3DCompiler.lib")
 
@@ -256,10 +334,147 @@ extern "C" typedef HRESULT(WINAPI* Func_D3DX10Compile)(void* srcData, size_t src
 	LPCSTR pFunctionName, LPCSTR pProfile, UINT Flags1, UINT Flags2, ID3D10Blob** ppShader, ID3D10Blob** ppErrorMsgs);
 static Func_D3DX10Compile gFunc_D3DX10Compile;
 
+// Include resolution shared by the compile-time ID3DInclude handler and the cache's include hash
+// walk -- the hash must cover exactly the files the compiler would open, so there is one resolver:
+// the including file's own directory first, then the registered search dirs.
+static bool ResolveShaderInclude(const StringImpl& includerDir, const StringImpl& name, String& outPath)
+{
+	String path;
+	if (!includerDir.IsEmpty())
+		path = includerDir + "\\" + name;
+	else
+		path = name;
+	if (FileExists(path))
+	{
+		outPath = path;
+		return true;
+	}
+	for (auto& dir : GetShaderIncludeDirs())
+	{
+		path = dir + name;
+		if (FileExists(path))
+		{
+			outPath = path;
+			return true;
+		}
+	}
+	return false;
+}
+
+// Case- and separator-insensitive identity for the visited set (diamond includes, cycles).
+static String CanonicalIncludeKey(const StringImpl& path)
+{
+	String key;
+	for (int i = 0; i < (int)path.length(); i++)
+	{
+		char c = path[i];
+		if (c == '/')
+			c = '\\';
+		key.Append((char)tolower((uint8)c));
+	}
+	return key;
+}
+
+// Conservative textual walk of the #include closure, folding each reachable file's bytes into
+// `hash`. Over-approximates: an include mentioned inside a disabled #if or a block comment is
+// still hashed, which only costs a spurious recompile. Misses only macro-computed includes
+// (#include FOO) -- don't write those. An unresolvable name is skipped; if it's real, the
+// compile itself reports it.
+static uint64 HashShaderIncludes(const StringImpl& includerDir, const char* data, int size, uint64 hash, std::set<String>& visited)
+{
+	int i = 0;
+	while (i < size)
+	{
+		int j = i;
+		while ((j < size) && ((data[j] == ' ') || (data[j] == '\t')))
+			j++;
+		int lineEnd = j;
+		while ((lineEnd < size) && (data[lineEnd] != '\n'))
+			lineEnd++;
+		if ((j < size) && (data[j] == '#'))
+		{
+			j++;
+			while ((j < size) && ((data[j] == ' ') || (data[j] == '\t')))
+				j++;
+			if ((j + 7 <= size) && (strncmp(data + j, "include", 7) == 0))
+			{
+				j += 7;
+				while ((j < size) && ((data[j] == ' ') || (data[j] == '\t')))
+					j++;
+				if ((j < lineEnd) && ((data[j] == '"') || (data[j] == '<')))
+				{
+					char closeC = (data[j] == '"') ? '"' : '>';
+					j++;
+					int nameStart = j;
+					while ((j < lineEnd) && (data[j] != closeC))
+						j++;
+					if ((j < lineEnd) && (j > nameStart))
+					{
+						String name(data + nameStart, j - nameStart);
+						String path;
+						if (ResolveShaderInclude(includerDir, name, path))
+						{
+							if (visited.insert(CanonicalIncludeKey(path)).second)
+							{
+								int incSize = 0;
+								uint8* incData = LoadBinaryData(path, &incSize);
+								if (incData != NULL)
+								{
+									hash = Hash64(incData, incSize, hash);
+									hash = HashShaderIncludes(GetFileDir(path), (const char*)incData, incSize, hash, visited);
+									delete [] incData;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		i = lineEnd + 1;
+	}
+	return hash;
+}
+
+// Feeds #include to the D3D compiler, tracking each opened file's directory so nested includes
+// resolve relative to their includer -- the same resolution HashShaderIncludes walks.
+class BFShaderIncludeHandler : public ID3DInclude
+{
+public:
+	String mBaseDir;
+	std::map<const void*, String> mOpenDirs;
+
+public:
+	HRESULT STDMETHODCALLTYPE Open(D3D_INCLUDE_TYPE includeType, LPCSTR pFileName, LPCVOID pParentData, LPCVOID* ppData, UINT* pBytes) override
+	{
+		String includerDir = mBaseDir;
+		auto itr = mOpenDirs.find(pParentData);
+		if (itr != mOpenDirs.end())
+			includerDir = itr->second;
+		String path;
+		if (!ResolveShaderInclude(includerDir, String(pFileName), path))
+			return E_FAIL;
+		int size = 0;
+		uint8* data = LoadBinaryData(path, &size);
+		if (data == NULL)
+			return E_FAIL;
+		mOpenDirs[data] = GetFileDir(path);
+		*ppData = data;
+		*pBytes = (UINT)size;
+		return S_OK;
+	}
+
+	HRESULT STDMETHODCALLTYPE Close(LPCVOID pData) override
+	{
+		mOpenDirs.erase(pData);
+		delete [] (uint8*)pData;
+		return S_OK;
+	}
+};
+
 // Compiled shaders are cached next to the source as "<file>_<entry>_<profile>", keyed by a hash of
-// the exact bytes handed to the compiler (plus entry/profile/flags) -- not by file times, which lie
-// whenever a copy preserves mtimes or the clock/zone shifts. Layout: ShaderCacheHeader then the raw
-// DXBC blob. A missing/legacy/mismatched header just means recompile.
+// the exact bytes handed to the compiler (plus the #include closure and entry/profile/flags) --
+// not by file times, which lie whenever a copy preserves mtimes or the clock/zone shifts. Layout:
+// ShaderCacheHeader then the raw DXBC blob. A missing/legacy/mismatched header just means recompile.
 struct ShaderCacheHeader
 {
 	uint32 mMagic;
@@ -323,7 +538,9 @@ static void WriteShaderCache(const StringImpl& cachePath, uint64 hash, ID3D10Blo
 	fclose(fp);
 }
 
-static bool LoadDXShader(const StringImpl& filePath, const StringImpl& entry, const StringImpl& profile, ID3D10Blob** outBuffer)
+// Failure fills outError (if given) and returns false -- never fatal, so a bad user shader can be
+// reported instead of killing the app (see Gfx_GetShaderError).
+static bool LoadDXShader(const StringImpl& filePath, const StringImpl& entry, const StringImpl& profile, ID3D10Blob** outBuffer, String* outError)
 {
 	String cachePath = filePath + "_" + entry + "_" + profile;
 
@@ -334,11 +551,18 @@ static bool LoadDXShader(const StringImpl& filePath, const StringImpl& entry, co
 		// No source at all (eg a shipped build) -- whatever cache exists is the best we have.
 		if (ReadShaderCache(cachePath, 0, false, outBuffer))
 			return true;
-		BF_FATAL(StrFormat("Shader source not found: %s", filePath.c_str()).c_str());
+		if (outError != NULL)
+			*outError = StrFormat("Shader source not found: %s", filePath.c_str());
 		return false;
 	}
 
 	uint64 hash = Hash64(srcData, srcSize);
+	{
+		// Fold in the include closure. A shader with no includes hashes exactly as before, so
+		// existing caches stay valid.
+		std::set<String> visited;
+		hash = HashShaderIncludes(GetFileDir(filePath), (const char*)srcData, srcSize, hash, visited);
+	}
 	hash = Hash64(entry.c_str(), (int)entry.length(), hash);
 	hash = Hash64(profile.c_str(), (int)profile.length(), hash);
 	hash = Hash64(&cShaderCompileFlags, sizeof(cShaderCompileFlags), hash);
@@ -361,26 +585,30 @@ static bool LoadDXShader(const StringImpl& filePath, const StringImpl& entry, co
 		delete [] srcData;
 		if (ReadShaderCache(cachePath, hash, false, outBuffer))
 			return true;
-		BF_FATAL("Shader compiler unavailable and no cached shader");
+		if (outError != NULL)
+			*outError = StrFormat("Shader compiler unavailable and no cached shader: %s", filePath.c_str());
 		return false;
 	}
 
-	// Compiled from the in-memory bytes (the same bytes the hash covers) -- note this means #include
-	// isn't supported.
+	// The real path as the source name puts actual file/line info in compile errors.
+	BFShaderIncludeHandler includeHandler;
+	includeHandler.mBaseDir = GetFileDir(filePath);
 	ID3D10Blob* errorMessage = NULL;
-	HRESULT dxResult = gFunc_D3DX10Compile(srcData, srcSize, "Shader", NULL, NULL, entry.c_str(), profile.c_str(),
+	HRESULT dxResult = gFunc_D3DX10Compile(srcData, srcSize, (char*)filePath.c_str(), NULL, &includeHandler, entry.c_str(), profile.c_str(),
 		cShaderCompileFlags, 0, outBuffer, &errorMessage);
 	delete [] srcData;
 
 	if (FAILED(dxResult))
 	{
-		if (errorMessage != NULL)
+		if (outError != NULL)
 		{
-			BF_FATAL(StrFormat("Shader compile failed (%s): %s", filePath.c_str(), (char*)errorMessage->GetBufferPointer()).c_str());
-			errorMessage->Release();
+			if (errorMessage != NULL)
+				*outError = StrFormat("Shader compile failed (%s):\n%s", filePath.c_str(), (char*)errorMessage->GetBufferPointer());
+			else
+				*outError = StrFormat("Shader compile failed: %s", filePath.c_str());
 		}
-		else
-			BF_FATAL(StrFormat("Shader compile failed: %s", filePath.c_str()).c_str());
+		if (errorMessage != NULL)
+			errorMessage->Release();
 		return false;
 	}
 
@@ -388,10 +616,8 @@ static bool LoadDXShader(const StringImpl& filePath, const StringImpl& entry, co
 	return true;
 }
 
-static bool LoadDXShader(Span<uint8> fileData, const StringImpl& entry, const StringImpl& profile, ID3D10Blob** outBuffer)
+static bool LoadDXShader(Span<uint8> fileData, const StringImpl& entry, const StringImpl& profile, ID3D10Blob** outBuffer, String* outError)
 {
-	HRESULT hr;
-	
 	if (gFunc_D3DX10Compile == NULL)
 	{
 		auto lib = LoadLibraryA("D3DCompiler_47.dll");
@@ -403,15 +629,17 @@ static bool LoadDXShader(Span<uint8> fileData, const StringImpl& entry, const St
 	auto dxResult = gFunc_D3DX10Compile(fileData.mVals, fileData.mSize, "ShaderSource", NULL, NULL, entry.c_str(), profile.c_str(),
 		D3D10_SHADER_DEBUG | D3D10_SHADER_ENABLE_STRICTNESS, 0, outBuffer, &errorMessage);
 
-	if (DXFAILED(dxResult))
+	if (FAILED(dxResult))
 	{
-		if (errorMessage != NULL)
+		if (outError != NULL)
 		{
-			BF_FATAL(StrFormat("Vertex shader load failed: %s", (char*)errorMessage->GetBufferPointer()).c_str());
-			errorMessage->Release();
+			if (errorMessage != NULL)
+				*outError = StrFormat("Shader compile failed (packed %s):\n%s", entry.c_str(), (char*)errorMessage->GetBufferPointer());
+			else
+				*outError = StrFormat("Shader compile failed (packed %s)", entry.c_str());
 		}
-		else
-			BF_FATAL("Shader load failed");
+		if (errorMessage != NULL)
+			errorMessage->Release();
 		return false;
 	}
 
@@ -420,16 +648,15 @@ static bool LoadDXShader(Span<uint8> fileData, const StringImpl& entry, const St
 
 bool DXShader::Load()
 {
-	//HRESULT hr;
+	mCompileError.Clear();
 
-	ID3D10Blob* errorMessage = NULL;
 	ID3D10Blob* vertexShaderBuffer = NULL;
 	ID3D10Blob* pixelShaderBuffer = NULL;
 
 	void* memPtr = NULL;
 	int memSize = 0;
 	if (ParseMemorySpan(mSrcPath, memPtr, memSize))
-	{		
+	{
 		int crPos = (int)mSrcPath.IndexOf('\n');
 		if (crPos != -1)
 		{
@@ -440,20 +667,33 @@ bool DXShader::Load()
 				D3D10CreateBlob(memSize, &vertexShaderBuffer);
 				memcpy(vertexShaderBuffer->GetBufferPointer(), memPtr, memSize);
 				D3D10CreateBlob(memSize2, &pixelShaderBuffer);
-				memcpy(pixelShaderBuffer->GetBufferPointer(), memPtr2, memSize2);	
+				memcpy(pixelShaderBuffer->GetBufferPointer(), memPtr2, memSize2);
 			}
 		}
 		else
 		{
 			Span<uint8> span((uint8*)memPtr, memSize);
-			LoadDXShader(span, "VS", "vs_4_0", &vertexShaderBuffer);
-			LoadDXShader(span, "PS", "ps_4_0", &pixelShaderBuffer);
+			if (LoadDXShader(span, "VS", "vs_4_0", &vertexShaderBuffer, &mCompileError))
+				LoadDXShader(span, "PS", "ps_4_0", &pixelShaderBuffer, &mCompileError);
 		}
 	}
 	else
 	{
-		LoadDXShader(mSrcPath + ".fx", "VS", "vs_4_0", &vertexShaderBuffer);
-		LoadDXShader(mSrcPath + ".fx", "PS", "ps_4_0", &pixelShaderBuffer);
+		String fxPath = mSrcPath + ".fx";
+		if (LoadDXShader(fxPath, String("VS") + mEntrySuffix, "vs_4_0", &vertexShaderBuffer, &mCompileError))
+			LoadDXShader(fxPath, String("PS") + mEntrySuffix, "ps_4_0", &pixelShaderBuffer, &mCompileError);
+	}
+
+	if ((vertexShaderBuffer == NULL) || (pixelShaderBuffer == NULL))
+	{
+		// The object stays alive so the caller can read mCompileError -- it must not be drawn with.
+		if (mCompileError.IsEmpty())
+			mCompileError = StrFormat("Shader load failed: %s", mSrcPath.c_str());
+		if (vertexShaderBuffer != NULL)
+			vertexShaderBuffer->Release();
+		if (pixelShaderBuffer != NULL)
+			pixelShaderBuffer->Release();
+		return false;
 	}
 
 	defer(
@@ -630,8 +870,39 @@ DXTexture::DXTexture()
 
 DXTexture::~DXTexture()
 {
+	// Identity-checked: a retired texture already left the map, and a same-path successor may
+	// occupy the entry by now.
 	if ((!mPath.IsEmpty()) && (mRenderDevice != NULL))
-		((DXRenderDevice*)mRenderDevice)->mTextureMap.Remove(mPath);
+	{
+		DXTexture* mapped = NULL;
+		if ((mRenderDevice->mTextureMap.TryGetValue(mPath, &mapped)) && (mapped == this))
+			mRenderDevice->mTextureMap.Remove(mPath);
+	}
+
+	if (mRenderDevice != NULL)
+	{
+		// Scrub the device's state records: PhysSetAsTarget walks the bound-slot array, and a
+		// stale current-target cache could alias a later allocation at the same address.
+		for (int i = 0; i < 32; i++)
+		{
+			if (mRenderDevice->mPSBoundTextures[i] != this)
+				continue;
+			if (mRenderDevice->mD3DDeviceContext != NULL)
+			{
+				ID3D11ShaderResourceView* nullSrv = NULL;
+				mRenderDevice->mD3DDeviceContext->PSSetShaderResources(i, 1, &nullSrv);
+				if (i >= DX_VS_TEXTURE_SLOT)
+					mRenderDevice->mD3DDeviceContext->VSSetShaderResources(i, 1, &nullSrv);
+			}
+			mRenderDevice->mPSBoundTextures[i] = NULL;
+		}
+		if (mRenderDevice->mCurRenderTarget == this)
+			mRenderDevice->mCurRenderTarget = NULL;
+		if ((mD3DRenderTargetView != NULL) && (mRenderDevice->mCurD3DRTV == mD3DRenderTargetView))
+			mRenderDevice->mCurD3DRTV = NULL;
+		if ((mD3DDepthStencilView != NULL) && (mRenderDevice->mCurD3DDSV == mD3DDepthStencilView))
+			mRenderDevice->mCurD3DDSV = NULL;
+	}
 
 	//OutputDebugStrF("DXTexture::~DXTexture %@\n", this);
 	delete mContentBits;
@@ -651,6 +922,30 @@ DXTexture::~DXTexture()
 		mD3DTexture->Release();
 	if (mRenderDevice != NULL)
 		mRenderDevice->mTextures.Remove(this);
+}
+
+void DXTexture::Release()
+{
+	mRefCount--;
+	if (mRefCount == 0)
+	{
+		// Deferred: queued draw commands may still reference this texture until the frame's
+		// layers flush (see ProcessRetiredTextures).
+		if (mRenderDevice != NULL)
+		{
+			// Leave the load cache now -- a same-path load before the flush must create a fresh
+			// texture, not resurrect this one.
+			if (!mPath.IsEmpty())
+			{
+				DXTexture* mapped = NULL;
+				if ((mRenderDevice->mTextureMap.TryGetValue(mPath, &mapped)) && (mapped == this))
+					mRenderDevice->mTextureMap.Remove(mPath);
+			}
+			mRenderDevice->RetireTexture(this);
+		}
+		else
+			delete this;
+	}
 }
 
 void DXTexture::ReleaseNative()
@@ -738,6 +1033,28 @@ void DXTexture::ReinitNative()
 
 void DXTexture::PhysSetAsTarget()
 {
+	// Unbind any SRV slot still holding this texture (or a view sharing its resource) before it
+	// becomes a render/depth target. The runtime would force-null the slot anyway, but an explicit
+	// unbind takes the well-tested path; some drivers leave stale state behind the forced one.
+	for (int i = 0; i < 32; i++)
+	{
+		DXTexture* b = (DXTexture*)mRenderDevice->mPSBoundTextures[i];
+		if (b == NULL)
+			continue;
+		bool conflict = (b == this) || ((mSecondaryTarget != NULL) && (b == (DXTexture*)mSecondaryTarget));
+		if ((!conflict) && (b->mD3DDepthBuffer != NULL) && (b->mD3DDepthBuffer == mD3DDepthBuffer))
+			conflict = true;
+		if ((!conflict) && (b->mD3DTexture != NULL) && (b->mD3DTexture == mD3DTexture))
+			conflict = true;
+		if (conflict)
+		{
+			ID3D11ShaderResourceView* nullSrv = NULL;
+			mRenderDevice->mD3DDeviceContext->PSSetShaderResources(i, 1, &nullSrv);
+			if (i >= DX_VS_TEXTURE_SLOT)
+				mRenderDevice->mD3DDeviceContext->VSSetShaderResources(i, 1, &nullSrv);
+			mRenderDevice->mPSBoundTextures[i] = NULL;
+		}
+	}
 	{
 		D3D11_VIEWPORT viewPort;
 		viewPort.Width = (float)mWidth;
@@ -781,9 +1098,15 @@ DXStructuredBuffer::DXStructuredBuffer()
 {
 	mD3DBuffer = NULL;
 	mD3DStaging = NULL;
+	for (int i = 0; i < 3; i++)
+		mD3DUpdateStaging[i] = NULL;
+	mUpdateStagingIdx = 0;
+	mD3DUploadBuffer = NULL;
+	mUploadPtr = NULL;
 	mStride = 0;
 	mGpuWritable = false;
 	mDefaultUsage = false;
+	mStreaming = false;
 }
 
 DXStructuredBuffer::~DXStructuredBuffer()
@@ -792,6 +1115,11 @@ DXStructuredBuffer::~DXStructuredBuffer()
 		mD3DBuffer->Release();
 	if (mD3DStaging != NULL)
 		mD3DStaging->Release();
+	for (int i = 0; i < 3; i++)
+		if (mD3DUpdateStaging[i] != NULL)
+			mD3DUpdateStaging[i]->Release();
+	if (mD3DUploadBuffer != NULL)
+		mD3DUploadBuffer->Release();
 }
 
 void DXStructuredBuffer::PhysSetAsTarget()
@@ -801,10 +1129,79 @@ void DXStructuredBuffer::PhysSetAsTarget()
 
 void DXStructuredBuffer::UpdateBufferRange(int offset, void* data, int size)
 {
-	BF_ASSERT(mDefaultUsage);
+	BF_ASSERT(mDefaultUsage || mStreaming);
 	BF_ASSERT((offset >= 0) && (size > 0) && (offset + size <= mStride * mWidth));
+	auto ctx = mRenderDevice->mD3DDeviceContext;
+	if (mStreaming)
+	{
+		// Append-only per-frame stream: DISCARD on the frame's first range (offset 0), NO_OVERWRITE
+		// for the appends after it.
+		D3D11_MAP mapKind = (offset == 0) ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE;
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		if (SUCCEEDED(ctx->Map(mD3DBuffer, 0, mapKind, 0, &mapped)))
+		{
+			memcpy((uint8*)mapped.pData + offset, data, size);
+			ctx->Unmap(mD3DBuffer, 0);
+		}
+		return;
+	}
+	// Batched staged copy rather than UpdateSubresource: a boxed UpdateSubresource on a buffer with
+	// in-flight reads garbles what those reads fetch on some drivers, and a Map per range stalls
+	// against the copies already queued. Writes accumulate in one DISCARD-mapped upload buffer and
+	// land as GPU-queue copies at FlushUpdates -- ordered like any draw, nothing to rename.
+	if (BRISK_DBG_UPDATE_LEGACY())
+	{
+		D3D11_BOX legacyBox = { (UINT)offset, 0, 0, (UINT)(offset + size), 1, 1 };
+		ctx->UpdateSubresource(mD3DBuffer, 0, &legacyBox, data, 0, 0);
+		return;
+	}
+	if (!BRISK_DBG_UPDATE_UNBATCHED())
+	{
+		if (mD3DUploadBuffer == NULL)
+		{
+			D3D11_BUFFER_DESC desc;
+			ZeroMemory(&desc, sizeof(desc));
+			desc.Usage = D3D11_USAGE_DYNAMIC;
+			desc.ByteWidth = mStride * mWidth;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+			desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+			desc.StructureByteStride = mStride;
+			if (FAILED(mRenderDevice->mD3DDevice->CreateBuffer(&desc, NULL, &mD3DUploadBuffer)))
+				return;
+		}
+		if (mUploadPtr == NULL)
+		{
+			D3D11_MAPPED_SUBRESOURCE upMapped;
+			if (FAILED(ctx->Map(mD3DUploadBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &upMapped)))
+				return;
+			mUploadPtr = upMapped.pData;
+		}
+		memcpy((uint8*)mUploadPtr + offset, data, size);
+		mPendingRanges.push_back(offset);
+		mPendingRanges.push_back(size);
+		return;
+	}
+	if (mD3DUpdateStaging[0] == NULL)
+	{
+		D3D11_BUFFER_DESC desc;
+		ZeroMemory(&desc, sizeof(desc));
+		desc.Usage = D3D11_USAGE_STAGING;
+		desc.ByteWidth = mStride * mWidth;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		for (int i = 0; i < 3; i++)
+			if (FAILED(mRenderDevice->mD3DDevice->CreateBuffer(&desc, NULL, &mD3DUpdateStaging[i])))
+				return;
+	}
+	mUpdateStagingIdx = (mUpdateStagingIdx + 1) % 3;
+	ID3D11Buffer* staging = mD3DUpdateStaging[mUpdateStagingIdx];
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (FAILED(ctx->Map(staging, 0, D3D11_MAP_WRITE, 0, &mapped)))
+		return;
+	memcpy((uint8*)mapped.pData + offset, data, size);
+	ctx->Unmap(staging, 0);
 	D3D11_BOX box = { (UINT)offset, 0, 0, (UINT)(offset + size), 1, 1 };
-	mRenderDevice->mD3DDeviceContext->UpdateSubresource(mD3DBuffer, 0, &box, data, 0, 0);
+	ctx->CopySubresourceRegion(mD3DBuffer, 0, (UINT)offset, 0, 0, staging, 0, &box);
 }
 
 bool DXStructuredBuffer::GetBufferData(void* outData, int size)
@@ -940,8 +1337,14 @@ bool DXComputeShader::Load()
 		return false;
 	}
 	ID3D10Blob* blob = NULL;
-	if (!LoadDXShader(mSrcPath + ".fx", mEntry, "cs_5_0", &blob))
+	String error;
+	if (!LoadDXShader(mSrcPath + ".fx", mEntry, "cs_5_0", &blob, &error))
+	{
+		// Compute shaders are engine-authored; keep the old hard failure until they need the
+		// reportable path.
+		BF_FATAL(error.c_str());
 		return false;
+	}
 	HRESULT hr = mRenderDevice->mD3DDevice->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), NULL, &mD3DComputeShader);
 	blob->Release();
 	return SUCCEEDED(hr);
@@ -1320,6 +1723,45 @@ StaticMesh* DXRenderDevice::CreateStaticMesh(int vertexSize, void* vtxData, int 
 	return mesh;
 }
 
+void DXRenderDevice::DrainDebugMessages()
+{
+	if (mD3DInfoQueue == NULL)
+		return;
+	UINT64 count = mD3DInfoQueue->GetNumStoredMessages();
+	for (UINT64 i = 0; i < count; i++)
+	{
+		SIZE_T msgLen = 0;
+		if (FAILED(mD3DInfoQueue->GetMessage(i, NULL, &msgLen)))
+			continue;
+		D3D11_MESSAGE* msg = (D3D11_MESSAGE*)malloc(msgLen);
+		if (SUCCEEDED(mD3DInfoQueue->GetMessage(i, msg, &msgLen)))
+			fprintf(stdout, "D3DDBG sev=%d id=%d: %.*s\n", (int)msg->Severity, (int)msg->ID, (int)msg->DescriptionByteLength, msg->pDescription);
+		free(msg);
+	}
+	if (count > 0)
+	{
+		fflush(stdout);
+		mD3DInfoQueue->ClearStoredMessages();
+	}
+}
+
+void DXStructuredBuffer::FlushBufferUpdates()
+{
+	if (mUploadPtr == NULL)
+		return;
+	auto ctx = mRenderDevice->mD3DDeviceContext;
+	ctx->Unmap(mD3DUploadBuffer, 0);
+	mUploadPtr = NULL;
+	for (size_t i = 0; i + 1 < mPendingRanges.size(); i += 2)
+	{
+		int offset = mPendingRanges[i];
+		int size = mPendingRanges[i + 1];
+		D3D11_BOX box = { (UINT)offset, 0, 0, (UINT)(offset + size), 1, 1 };
+		ctx->CopySubresourceRegion(mD3DBuffer, 0, (UINT)offset, 0, 0, mD3DUploadBuffer, 0, &box);
+	}
+	mPendingRanges.clear();
+}
+
 void DXRenderDevice::EnsureInstIota(int count)
 {
 	if (count <= mInstIotaCount)
@@ -1435,6 +1877,8 @@ void DXRenderDevice::PhysSetRenderState(RenderState* renderState)
 			else if (renderState->mSamplerKind == SamplerKind_Nearest)
 				samplerState = mD3DNearestSamplerState;
 			mD3DDeviceContext->PSSetSamplers(0, 1, &samplerState);
+			// Vertex-stage sampling (eg a surface shader's heightmap SampleLevel) sees the same s0.
+			mD3DDeviceContext->VSSetSamplers(0, 1, &samplerState);
 		}
 
 		if (dxShader != NULL)
@@ -1454,7 +1898,13 @@ void DXRenderDevice::PhysSetRenderState(RenderState* renderState)
 				{
 					D3D11_BUFFER_DESC matrixBufferDesc;
 					matrixBufferDesc.Usage = D3D11_USAGE_DYNAMIC;
-					matrixBufferDesc.ByteWidth = sizeof(float[4]);
+					// Only a float4 is used, but this buffer stays bound at VS b0 into draws whose
+					// shader declares a bigger b0 (the 3D World matrix). Those draws don't read it --
+					// instanced draws take their matrix from the instance record -- but D3D requires
+					// the bound buffer to be at least as large as the declaration, so size it to the
+					// largest b0 in use rather than moving the slot (2D shaders are framework-shared:
+					// BeefIDE and every Beefy2D app compile WindowSize into the implicit b0).
+					matrixBufferDesc.ByteWidth = sizeof(float[16]);
 					matrixBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 					matrixBufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 					matrixBufferDesc.MiscFlags = 0;
@@ -1478,15 +1928,13 @@ void DXRenderDevice::PhysSetRenderState(RenderState* renderState)
 
 				// Get a pointer to the data in the constant buffer.
 				float* dataPtr = (float*)mappedResource.pData;
+				memset(dataPtr, 0, sizeof(float[16]));
 				dataPtr[0] = (float)mCurRenderTarget->mWidth;
 				dataPtr[1] = (float)mCurRenderTarget->mHeight;
-				dataPtr[2] = 0;
-				dataPtr[3] = 0;
 
 				// Unlock the constant buffer.
 				mD3DDeviceContext->Unmap(mMatrix2DBuffer, 0);
 
-				//float params[4] = {mCurRenderTarget->mWidth, mCurRenderTarget->mHeight, 0, 0};
 				mD3DDeviceContext->VSSetConstantBuffers(0, 1, &mMatrix2DBuffer);
 			}
 		}
@@ -1606,8 +2054,11 @@ void DXRenderDevice::PhysSetRenderState(RenderState* renderState)
 			mD3DDeviceContext->OMSetRenderTargets(1, &mCurD3DRTV, mCurD3DDSV);
 	}
 
-	if (renderState->mDisableBlend != mPhysRenderState->mDisableBlend)
-		mD3DDeviceContext->OMSetBlendState(renderState->mDisableBlend ? NULL : mD3DNormalBlendState, NULL, 0xffffffff);
+	if ((renderState->mDisableBlend != mPhysRenderState->mDisableBlend) ||
+		(renderState->mAlphaToCoverage != mPhysRenderState->mAlphaToCoverage))
+		mD3DDeviceContext->OMSetBlendState(
+			renderState->mAlphaToCoverage ? mD3DA2CBlendState :
+			renderState->mDisableBlend ? NULL : mD3DNormalBlendState, NULL, 0xffffffff);
 
 	mPhysRenderState = renderState;
 }
@@ -2262,6 +2713,8 @@ void DXSetTextureCmd::Render(RenderDevice* renderDevice, RenderWindow* renderWin
 	DXRenderDevice* dxRenderDevice = (DXRenderDevice*)renderDevice;
 	ID3D11ShaderResourceView* srv = ((DXTexture*)mTexture)->mD3DResourceView;
 	dxRenderDevice->mD3DDeviceContext->PSSetShaderResources(mTextureIdx, 1, &srv);
+	if (mTextureIdx < 32)
+		dxRenderDevice->mPSBoundTextures[mTextureIdx] = mTexture;
 	// Slots from DX_VS_TEXTURE_SLOT up are readable by the vertex stage too (per-draw instance records).
 	if (mTextureIdx >= DX_VS_TEXTURE_SLOT)
 		dxRenderDevice->mD3DDeviceContext->VSSetShaderResources(mTextureIdx, 1, &srv);
@@ -2630,8 +3083,11 @@ void DXRenderWindow::Resized()
 void DXRenderWindow::Present()
 {
 	BP_ZONE("DXRenderWindow::Present");
+	((DXRenderDevice*)mRenderDevice)->DrainDebugMessages();
 	// Under external pacing our own vblank must never block the paced loop
 	bool useVSync = (mWindow->mFlags & BFWINDOW_VSYNC) && (gBFApp != NULL) && (!gBFApp->mExternalPacingActive);
+	if (BRISK_DBG_FORCE_VSYNC())
+		useVSync = true;
 	HRESULT hr = mDXSwapChain->Present(useVSync ? 1 : 0, 0);
 
 	if ((hr == DXGI_ERROR_DEVICE_REMOVED) || (hr == DXGI_ERROR_DEVICE_RESET))
@@ -2751,6 +3207,7 @@ bool DXRenderWindow::WaitForVBlank()
 DXRenderDevice::DXRenderDevice()
 {
 	mD3DDevice = NULL;
+	mD3DA2CBlendState = NULL;
 	mD3DDeviceContext1 = NULL;
 	mNeedsReinitNative = false;
 	mMatrix2DBuffer = NULL;
@@ -2767,6 +3224,8 @@ DXRenderDevice::DXRenderDevice()
 
 DXRenderDevice::~DXRenderDevice()
 {
+	ProcessRetiredTextures();
+
 	for (auto window : mRenderWindowList)
 		((DXRenderWindow*)window)->ReleaseNative();
 	for (auto shader : mShaders)
@@ -2803,9 +3262,49 @@ bool DXRenderDevice::Init(BFApp* app)
 
 	D3D_FEATURE_LEVEL d3dFeatureLevel = (D3D_FEATURE_LEVEL)0;
 	int flags = 0;
-	//TODO:
-	//flags = D3D11_CREATE_DEVICE_DEBUG;
-	DXCHECK(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, featureLevelArr, 6, D3D11_SDK_VERSION, &mD3DDevice, &d3dFeatureLevel, &mD3DDeviceContext));
+	bool wantD3DDebug = BRISK_DBG_WANT_D3D_DEBUG();
+	if (wantD3DDebug)
+		flags |= D3D11_CREATE_DEVICE_DEBUG;
+	// On hybrid-GPU machines the NULL (default) adapter is usually the integrated GPU; ask DXGI for
+	// the high-performance one. Falls back to the default adapter when the query isn't available.
+	IDXGIAdapter1* pPerfAdapter = NULL;
+	{
+		DXGI_GPU_PREFERENCE gpuPref = DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
+		if (BRISK_DBG_FORCE_IGPU())
+			gpuPref = DXGI_GPU_PREFERENCE_MINIMUM_POWER;
+		IDXGIFactory6* pFactory6 = NULL;
+		if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory6), (void**)&pFactory6)))
+		{
+			if (FAILED(pFactory6->EnumAdapterByGpuPreference(0, gpuPref,
+					__uuidof(IDXGIAdapter1), (void**)&pPerfAdapter)))
+				pPerfAdapter = NULL;
+			if (pPerfAdapter != NULL)
+			{
+				DXGI_ADAPTER_DESC1 adapterDesc;
+				if (SUCCEEDED(pPerfAdapter->GetDesc1(&adapterDesc)))
+					OutputDebugStrF("D3D adapter: %S\n", adapterDesc.Description);
+			}
+			pFactory6->Release();
+		}
+	}
+	HRESULT devResult = D3D11CreateDevice(pPerfAdapter, (pPerfAdapter != NULL) ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+		NULL, flags, featureLevelArr, 6, D3D11_SDK_VERSION, &mD3DDevice, &d3dFeatureLevel, &mD3DDeviceContext);
+	if ((FAILED(devResult)) && (wantD3DDebug))
+	{
+		// Debug layer needs the optional Graphics Tools feature; fall back without it.
+		fprintf(stdout, "D3DDBG debug layer unavailable, falling back\n"); fflush(stdout);
+		flags &= ~D3D11_CREATE_DEVICE_DEBUG;
+		wantD3DDebug = false;
+		devResult = D3D11CreateDevice(pPerfAdapter, (pPerfAdapter != NULL) ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+			NULL, flags, featureLevelArr, 6, D3D11_SDK_VERSION, &mD3DDevice, &d3dFeatureLevel, &mD3DDeviceContext);
+	}
+	DXCHECK(devResult);
+	if (pPerfAdapter != NULL)
+		pPerfAdapter->Release();
+	mD3DInfoQueue = NULL;
+	if (wantD3DDebug)
+		mD3DDevice->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&mD3DInfoQueue);
+	memset(mPSBoundTextures, 0, sizeof(mPSBoundTextures));
 	OutputDebugStrF("D3D Feature Level: %X\n", d3dFeatureLevel);
 	mD3DDeviceContext1 = NULL;
 	mD3DDeviceContext->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&mD3DDeviceContext1);
@@ -2867,6 +3366,14 @@ bool DXRenderDevice::Init(BFApp* app)
 	BlendState.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 	mD3DDevice->CreateBlendState(&BlendState, &mD3DNormalBlendState);
 
+	// Alpha-to-coverage: no color blending, output alpha becomes the MSAA coverage mask.
+	D3D11_BLEND_DESC a2cState;
+	ZeroMemory(&a2cState, sizeof(D3D11_BLEND_DESC));
+	a2cState.AlphaToCoverageEnable = TRUE;
+	a2cState.RenderTarget[0].BlendEnable = FALSE;
+	a2cState.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+	mD3DDevice->CreateBlendState(&a2cState, &mD3DA2CBlendState);
+
 	mD3DDeviceContext->OMSetBlendState(mD3DNormalBlendState, NULL, 0xffffffff);
 
 	D3D11_SAMPLER_DESC sampDesc;
@@ -2927,6 +3434,9 @@ bool DXRenderDevice::Init(BFApp* app)
 	sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
 	DXCHECK(mD3DDevice->CreateSamplerState(&sampDesc, &mD3DTrilinearSamplerState));
 	mD3DDeviceContext->PSSetSamplers(2, 1, &mD3DTrilinearSamplerState);
+	// s0 starts explicitly on the default sampler; PhysSetRenderState only rebinds on change.
+	mD3DDeviceContext->PSSetSamplers(0, 1, &mD3DDefaultSamplerState);
+	mD3DDeviceContext->VSSetSamplers(0, 1, &mD3DDefaultSamplerState);
 
 	D3D11_BUFFER_DESC bd;
 	bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -3130,6 +3640,11 @@ void DXRenderDevice::ReleaseNative()
 	mD3DIndexBuffer = NULL;
 	mD3DNormalBlendState->Release();
 	mD3DNormalBlendState = NULL;
+	if (mD3DA2CBlendState != NULL)
+	{
+		mD3DA2CBlendState->Release();
+		mD3DA2CBlendState = NULL;
+	}
 	mD3DDefaultSamplerState->Release();
 	mD3DDefaultSamplerState = NULL;
 	mD3DWrapSamplerState->Release();
@@ -3224,6 +3739,21 @@ void DXRenderDevice::FrameEnd()
 			}
 		}
 	}
+
+	ProcessRetiredTextures();
+}
+
+void DXRenderDevice::RetireTexture(DXTexture* texture)
+{
+	mRetiredTextures.Add(texture);
+}
+
+void DXRenderDevice::ProcessRetiredTextures()
+{
+	// Index loop: a dying texture can Release another (depth/raw refs) and append to the list.
+	for (int i = 0; i < mRetiredTextures.mSize; i++)
+		delete mRetiredTextures[i];
+	mRetiredTextures.Clear();
 }
 
 Texture* DXRenderDevice::LoadTexture(const StringImpl& fileName, int flags)
@@ -3246,16 +3776,21 @@ Texture* DXRenderDevice::LoadTexture(const StringImpl& fileName, int flags)
 		return aTexture;
 	}
 
+	bool useLoadCache = ((flags & TextureFlag_UseLoadCache) != 0);
+
 	String pathEx = fileName;
-	if ((flags & TextureFlag_Additive) != 0)
-		pathEx += ":add";
-	if ((flags & TextureFlag_Mipmaps) != 0)
-		pathEx += ":mip";
-	if ((flags & TextureFlag_Srgb) != 0)
-		pathEx += ":srgb";
+	if (useLoadCache)
+	{
+		if ((flags & TextureFlag_Additive) != 0)
+			pathEx += ":add";
+		if ((flags & TextureFlag_Mipmaps) != 0)
+			pathEx += ":mip";
+		if ((flags & TextureFlag_Srgb) != 0)
+			pathEx += ":srgb";
+	}
 
 	DXTexture* aTexture = NULL;
-	if ((!fileName.StartsWith('@')) && (mTextureMap.TryGetValue(pathEx, &aTexture)))
+	if ((useLoadCache) && (!fileName.StartsWith('@')) && (mTextureMap.TryGetValue(pathEx, &aTexture)))
 	{
 		aTexture->AddRef();
 		return aTexture;
@@ -3397,7 +3932,7 @@ Texture* DXRenderDevice::LoadTexture(const StringImpl& fileName, int flags)
 	}
 
 	aTexture = (DXTexture*)RenderDevice::LoadTexture(fileName, flags);
-	if (aTexture != NULL)
+	if ((aTexture != NULL) && (useLoadCache))
 	{
 		aTexture->mPath = pathEx;
 		mTextureMap[aTexture->mPath] = aTexture;
@@ -3539,19 +4074,18 @@ Texture* DXRenderDevice::CreateDynTexture(int width, int height)
 	return aTexture;
 }
 
-Shader* DXRenderDevice::LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition)
+Shader* DXRenderDevice::LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition, const StringImpl& entrySuffix)
 {
 	BP_ZONE("DXRenderDevice::LoadShader");
 
 	DXShader* dxShader = new DXShader();
 	dxShader->mRenderDevice = this;
 	dxShader->mSrcPath = fileName;
+	dxShader->mEntrySuffix = entrySuffix;
 	dxShader->mVertexDef = new VertexDefinition(vertexDefinition);
-	if (!dxShader->Load())
-	{
-		delete dxShader;
-		return NULL;
-	}
+	// A failed Load still returns the object, with mCompileError set -- Gfx_GetShaderError
+	// surfaces it to the caller, who must not draw with it.
+	dxShader->Load();
 	mShaders.Add(dxShader);
 	return dxShader;
 }
@@ -3600,6 +4134,7 @@ Texture* DXRenderDevice::CreateRenderTarget(int width, int height, int flags, in
 	bool r16f = (flags & 0x80) != 0;
 	bool r32u = (flags & 0x100) != 0;
 	bool unorderedAccess = (flags & 0x200) != 0;
+	bool rg16f = (flags & 0x400) != 0;
 
 	// D3D11 shared resources can't be multisampled -- render into a private MSAA target and
 	// ResolveTo a shared one instead.
@@ -3611,7 +4146,8 @@ Texture* DXRenderDevice::CreateRenderTarget(int width, int height, int flags, in
 
 	DXGI_FORMAT format = highPrecision ? DXGI_FORMAT_R32_FLOAT : r8 ? DXGI_FORMAT_R8_UNORM :
 		f16 ? DXGI_FORMAT_R16G16B16A16_FLOAT : rg8 ? DXGI_FORMAT_R8G8_UNORM :
-		r16f ? DXGI_FORMAT_R16_FLOAT : r32u ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
+		r16f ? DXGI_FORMAT_R16_FLOAT : r32u ? DXGI_FORMAT_R32_UINT :
+		rg16f ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
 	int samples = ValidateSampleCount(mD3DDevice, format, sampleCount);
 
 	// Create the render target texture
@@ -3749,7 +4285,9 @@ Texture* DXRenderDevice::CreateStructuredBuffer(int stride, int count, int flags
 {
 	BF_ASSERT((stride > 0) && (stride % 4 == 0) && (count > 0));
 	bool gpuWritable = (flags & 1) != 0;
-	bool defaultUsage = gpuWritable || ((flags & 2) != 0);
+	bool streaming = (flags & 4) != 0;
+	bool defaultUsage = (gpuWritable || ((flags & 2) != 0)) && (!streaming);
+	BF_ASSERT(!(streaming && gpuWritable));
 
 	DXStructuredBuffer* buffer = new DXStructuredBuffer();
 	buffer->mWidth = count;
@@ -3757,6 +4295,7 @@ Texture* DXRenderDevice::CreateStructuredBuffer(int stride, int count, int flags
 	buffer->mStride = stride;
 	buffer->mGpuWritable = gpuWritable;
 	buffer->mDefaultUsage = defaultUsage;
+	buffer->mStreaming = streaming;
 	buffer->mRenderDevice = this;
 	buffer->AddRef();
 

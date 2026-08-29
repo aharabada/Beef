@@ -47,7 +47,9 @@ namespace Beefy.gfx
 			// Single-channel R32_UINT -- for compute atomics; not filterable, no mips.
 			R32Uint = 0x100,
 			// Also bindable as a compute UAV (RWTexture2D, mip 0); 1-sample, unshared only.
-			UnorderedAccess = 0x200
+			UnorderedAccess = 0x200,
+			// Two-channel R16G16_FLOAT -- paired half data (eg a ping-pong sim's h(t) + h(t-1)).
+			RG16F = 0x400
 		}
 
         public Image mSrcTexture;
@@ -81,6 +83,12 @@ namespace Beefy.gfx
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void* Gfx_CreateDepthImageRef(void* textureSegment);
+
+		// Always compiled regardless of DXRenderDevice.cpp's ENABLE_RUNTIME_DEBUG_FLAGS -- reports
+		// whether that define is active, so a caller can tell "checked, found nothing" apart from
+		// "never checked" instead of both looking like silence. See d3d_validation.py.
+		[CallingConvention(.Stdcall), CLink]
+		public static extern bool Gfx_RuntimeDebugFlagsCompiledIn();
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void* Gfx_CreateRawImageRef(void* textureSegment);

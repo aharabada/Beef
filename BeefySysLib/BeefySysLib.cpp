@@ -542,6 +542,11 @@ BF_EXPORT bool BF_CALLTYPE Gfx_Buffer_GetData(TextureSegment* textureSegment, vo
 
 // Immediate (not queued): writes [offset, offset+size) of a CPU-updatable buffer now, ahead of every
 // draw still waiting in any draw layer -- how a pass publishes data those queued draws will read.
+BF_EXPORT void BF_CALLTYPE Gfx_Buffer_FlushUpdates(TextureSegment* textureSegment)
+{
+	textureSegment->mTexture->FlushBufferUpdates();
+}
+
 BF_EXPORT void BF_CALLTYPE Gfx_Buffer_UpdateRange(TextureSegment* textureSegment, int offset, void* data, int size)
 {
 	textureSegment->mTexture->UpdateBufferRange(offset, data, size);
@@ -1277,9 +1282,27 @@ BF_EXPORT void BF_CALLTYPE RenderState_SetDisableBlend(RenderState* renderState,
 	renderState->SetDisableBlend(disable);
 }
 
-BF_EXPORT Shader* BF_CALLTYPE Gfx_LoadShader(const char* fileName, VertexDefinition* vertexDefinition)
+BF_EXPORT void BF_CALLTYPE RenderState_SetAlphaToCoverage(RenderState* renderState, bool enabled)
 {
-	return gBFApp->mRenderDevice->LoadShader(fileName, vertexDefinition);
+	renderState->SetAlphaToCoverage(enabled);
+}
+
+BF_EXPORT Shader* BF_CALLTYPE Gfx_LoadShader(const char* fileName, VertexDefinition* vertexDefinition, const char* entrySuffix)
+{
+	return gBFApp->mRenderDevice->LoadShader(fileName, vertexDefinition, entrySuffix);
+}
+
+// NULL = compiled clean; otherwise the compile error text (valid while the shader lives).
+BF_EXPORT const char* BF_CALLTYPE Gfx_GetShaderError(Shader* shader)
+{
+	if (shader->mCompileError.IsEmpty())
+		return NULL;
+	return shader->mCompileError.c_str();
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_AddShaderIncludeDir(const char* dir)
+{
+	AddShaderIncludeDir(dir);
 }
 
 BF_EXPORT void BF_CALLTYPE Gfx_SetRenderState(RenderState* renderState)
